@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -11,19 +12,54 @@ from specfile import Specfile
 
 from ymir.agents.constants import BRANCH_PREFIX, JIRA_COMMENT_TEMPLATE
 from ymir.agents.utils import check_subprocess, mcp_tools, run_subprocess, run_tool
-from ymir.common.base_utils import is_cs_branch
+from ymir.common.base_utils import is_cs_branch, is_modular_branch, resolve_dist_git_namespace
+from ymir.common.config import load_rhel_config
+from ymir.common.merge_queue import (  # noqa: F401 — re-exported for agents and tests
+    _CONSOLIDATION_HASH_KEY,
+    _consolidation_field_key,
+    complete_job,
+    pick_next_job,
+    submit_merge_job,
+    sweep_stale_active_jobs,
+)
 from ymir.common.models import (
     CachedMRMetadata,
     LogOutputSchema,
     MergeRequestDetails,
     OpenMergeRequestResult,
+    PackageConsolidationConfig,
     Task,
 )
 from ymir.common.utils import get_all_sources
+from ymir.common.version_utils import (
+    construct_internal_branch_name,
+    is_older_zstream,
+    parse_rhel_version,
+    parse_zstream_branch_name,
+)
+from ymir.tools.privileged.utils import APPLICABILITY_DIR, MERGE_REQUESTS_DIR
 from ymir.tools.unprivileged.specfile import UpdateReleaseTool
 from ymir.tools.unprivileged.wicked_git import RunPackagePrepTool
 
 logger = logging.getLogger(__name__)
+
+
+async def needs_zstream_target_label(dist_git_branch: str, fix_version: str | None) -> bool:
+    """Check if the fix targets a z-stream on an active CentOS Stream.
+
+    Maintenance streams (e.g. c8s / RHEL 8) are excluded — all builds there are
+    z-stream by default, so the label would add no information.
+    """
+    if not fix_version or not is_cs_branch(dist_git_branch):
+        return False
+    parsed = parse_rhel_version(fix_version)
+    if not parsed or not parsed[2]:
+        return False
+
+    config = await load_rhel_config()
+    major = parsed[0]
+    y_streams = config.get("current_y_streams", {})
+    return major in y_streams
 
 
 async def _clone_fedora_dist_git(package: str, destination: Path) -> bool:
@@ -47,37 +83,67 @@ async def _clone_fedora_dist_git(package: str, destination: Path) -> bool:
     return True
 
 
+def _force_rmtree(path: Path | str) -> None:
+    """Best-effort removal of a directory tree.
+
+    In containerised setups the MCP gateway (running as a different UID)
+    creates files that the agent container cannot delete.  We try
+    ``rm -rf`` and tolerate partial failures — the subsequent clone will
+    reinitialise the git state over any leftover files.
+    """
+    result = subprocess.run(["rm", "-rf", str(path)], capture_output=True)  # noqa: S603, S607
+    if result.returncode != 0:
+        logger.warning(
+            "Could not fully remove %s (exit %d): %s — proceeding anyway",
+            path,
+            result.returncode,
+            result.stderr.decode().strip(),
+        )
+
+
 async def fork_and_prepare_dist_git(
     jira_issue: str,
     package: str,
     dist_git_branch: str,
     available_tools: list[Tool],
     with_fedora: bool = False,
+    dist_git_namespace: str | None = None,
 ) -> tuple[Path, str, str, Path | None]:
     if not jira_issue or Path(jira_issue).is_absolute() or ".." in jira_issue:
         raise ValueError(f"Invalid jira_issue: {jira_issue}")
     working_dir = Path(os.environ["GIT_REPO_BASEPATH"]) / jira_issue
     if working_dir.is_dir():
-        shutil.rmtree(working_dir, ignore_errors=False)
+        _force_rmtree(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
-    namespace = "centos-stream" if is_cs_branch(dist_git_branch) else "rhel"
+    namespace = resolve_dist_git_namespace(dist_git_branch, dist_git_namespace)
     repository = f"https://gitlab.com/redhat/{namespace}/rpms/{package}"
     fork_url = await run_tool("fork_repository", repository=repository, available_tools=available_tools)
     local_clone = working_dir / package
-    if not is_cs_branch(dist_git_branch):
+    # create_zstream_branch only applies to plain internal rhel-X.Y[.0] branches;
+    # modular stream-* branches already exist in the rhel project.
+    if not is_cs_branch(dist_git_branch) and not is_modular_branch(dist_git_branch):
         await run_tool(
             "create_zstream_branch",
             package=package,
             branch=dist_git_branch,
             available_tools=available_tools,
         )
-    await run_tool(
-        "clone_repository",
-        repository=repository,
-        branch=dist_git_branch,
-        clone_path=str(local_clone),
-        available_tools=available_tools,
-    )
+    if await is_older_zstream(dist_git_branch):
+        await run_tool(
+            "clone_repository",
+            repository=repository,
+            clone_path=str(local_clone),
+            available_tools=available_tools,
+        )
+        await check_subprocess(["git", "checkout", dist_git_branch], cwd=local_clone)
+    else:
+        await run_tool(
+            "clone_repository",
+            repository=repository,
+            branch=dist_git_branch,
+            clone_path=str(local_clone),
+            available_tools=available_tools,
+        )
     update_branch = f"{BRANCH_PREFIX}-{jira_issue}"
     await check_subprocess(["git", "checkout", "-B", update_branch], cwd=local_clone)
     fedora_clone = None
@@ -88,12 +154,39 @@ async def fork_and_prepare_dist_git(
     return local_clone, update_branch, fork_url, fedora_clone
 
 
+async def find_leading_zstream_branch(dist_git_branch: str) -> str | None:
+    """Return the current (leading) z-stream branch if it is higher than *dist_git_branch*.
+
+    Looks up the leading z-stream for the same RHEL major version from
+    rhel-config.json and returns its dist-git branch name, or ``None`` when
+    the branch is already the leading z-stream (or not a z-stream at all).
+    """
+    parsed = parse_zstream_branch_name(dist_git_branch)
+    if not parsed:
+        return None
+    major, minor_str = parsed
+
+    from ymir.common.config import load_rhel_config
+
+    config = await load_rhel_config()
+    current_zstream = (config.get("current_z_streams") or {}).get(major)
+    if not current_zstream:
+        return None
+    current_parsed = parse_rhel_version(current_zstream)
+    if not current_parsed:
+        return None
+    current_minor = int(current_parsed[1])
+    if current_minor <= int(minor_str):
+        return None
+    return construct_internal_branch_name(major, current_parsed[1])
+
+
 async def prepare_dist_git_from_merge_request(
     merge_request_url: str,
     available_tools: list[Tool],
     with_fedora: bool = False,
 ) -> tuple[Path, MergeRequestDetails, Path | None]:
-    working_dir = Path(os.environ["GIT_REPO_BASEPATH"]) / "merge_requests"
+    working_dir = Path(os.environ["GIT_REPO_BASEPATH"]) / MERGE_REQUESTS_DIR
     working_dir.mkdir(parents=True, exist_ok=True)
     local_clone = working_dir / urlparse(merge_request_url).path.replace("/", "_")
     shutil.rmtree(local_clone, ignore_errors=True)
@@ -113,7 +206,7 @@ async def prepare_dist_git_from_merge_request(
     fedora_clone = None
     if with_fedora:
         package = details.target_repo_name
-        fedora_clone = working_dir / f"{package}-fedora"
+        fedora_clone = working_dir / f"{package}-fedora-{local_clone.name}"
         if not await _clone_fedora_dist_git(package, fedora_clone):
             fedora_clone = None
     return local_clone, details, fedora_clone
@@ -195,6 +288,36 @@ async def commit_and_push(
     return True
 
 
+async def request_mr_reviews(
+    package: str,
+    dist_git_branch: str,
+    mr_url: str,
+    available_tools: list[Tool],
+) -> None:
+    """Best-effort reviewer assignment — logs warnings but never raises."""
+    if os.getenv("ASSIGN_MR_REVIEWERS", "false").lower() != "true":
+        return
+    try:
+        reviewer_ids = await run_tool(
+            "resolve_reviewers",
+            package=package,
+            dist_git_branch=dist_git_branch,
+            available_tools=available_tools,
+        )
+        if not reviewer_ids:
+            logger.info("No reviewers resolved for %s (%s)", package, dist_git_branch)
+            return
+        await run_tool(
+            "set_merge_request_reviewers",
+            merge_request_url=mr_url,
+            reviewer_ids=reviewer_ids,
+            available_tools=available_tools,
+        )
+        logger.info("Assigned reviewers %s to MR %s", reviewer_ids, mr_url)
+    except Exception as e:
+        logger.warning("Failed to assign reviewers to MR %s: %s", mr_url, e)
+
+
 async def commit_push_and_open_mr(
     local_clone: Path,
     commit_message: str,
@@ -207,6 +330,7 @@ async def commit_push_and_open_mr(
     commit_only: bool = False,
     allow_empty: bool = False,
     labels: list[str] | None = None,
+    package: str | None = None,
 ) -> tuple[str | None, bool]:
     """
     Commits the changes to the local clone and opens a merge request.
@@ -225,17 +349,22 @@ async def commit_push_and_open_mr(
         allow_empty,
     ):
         return None, False
+    tool_kwargs = {
+        "fork_url": fork_url,
+        "title": mr_title,
+        "description": mr_description,
+        "target": dist_git_branch,
+        "source": update_branch,
+    }
+    if labels:
+        tool_kwargs["labels"] = labels
     result = await run_tool(
         "open_merge_request",
-        fork_url=fork_url,
-        title=mr_title,
-        description=mr_description,
-        target=dist_git_branch,
-        source=update_branch,
+        **tool_kwargs,
         available_tools=available_tools,
     )
     mr = OpenMergeRequestResult.model_validate(result)
-    if mr.url and labels:
+    if not mr.is_new_mr and mr.url and labels:
         try:
             await run_tool(
                 "add_merge_request_labels",
@@ -245,6 +374,8 @@ async def commit_push_and_open_mr(
             )
         except Exception as e:
             logger.warning(f"Failed to add labels {labels} to MR {mr.url}: {e}")
+    if mr.url and mr.is_new_mr and package:
+        await request_mr_reviews(package, dist_git_branch, mr.url, available_tools)
     return mr.url, mr.is_new_mr
 
 
@@ -336,7 +467,8 @@ async def change_jira_status(
     )
 
 
-async def get_jira_labels(jira_issue: str) -> list[str]:
+async def get_jira_issue_metadata(jira_issue: str) -> tuple[list[str], str | None]:
+    """Fetch labels and status for a Jira issue in a single API call."""
     try:
         async with mcp_tools(os.environ["MCP_GATEWAY_URL"]) as gateway_tools:
             details = await run_tool(
@@ -344,10 +476,12 @@ async def get_jira_labels(jira_issue: str) -> list[str]:
                 issue_key=jira_issue,
                 available_tools=gateway_tools,
             )
-            return details.get("fields", {}).get("labels", [])
+            labels = details.get("fields", {}).get("labels", [])
+            status = details.get("fields", {}).get("status", {}).get("name")
+            return labels, status
     except Exception as e:
-        logger.warning(f"Failed to get labels for {jira_issue}: {e}")
-        return []
+        logger.warning(f"Failed to get metadata for {jira_issue}: {e}")
+        return [], None
 
 
 # Intermediate "_failed" labels (transient retry-state) are suppressed for
@@ -542,6 +676,7 @@ async def clone_and_prep_sources(
     available_tools: list[Tool],
     jira_issue: str,
     ref: str | None = None,
+    dist_git_namespace: str | None = None,
 ) -> tuple[Path, Path, bool]:
     """
     Clone dist-git repo and run centpkg/rhpkg sources + prep.
@@ -558,13 +693,13 @@ async def clone_and_prep_sources(
     """
     if not jira_issue or Path(jira_issue).is_absolute() or ".." in jira_issue:
         raise ValueError(f"Invalid jira_issue: {jira_issue}")
-    working_dir = Path(os.environ["GIT_REPO_BASEPATH"]) / "applicability" / jira_issue
+    working_dir = Path(os.environ["GIT_REPO_BASEPATH"]) / APPLICABILITY_DIR / jira_issue
     if working_dir.is_dir():
-        shutil.rmtree(working_dir)
+        _force_rmtree(working_dir)
     working_dir.mkdir(parents=True, exist_ok=True)
     local_clone = working_dir / package
 
-    namespace = "centos-stream" if is_cs_branch(dist_git_branch) else "rhel"
+    namespace = resolve_dist_git_namespace(dist_git_branch, dist_git_namespace)
     repository = f"https://gitlab.com/redhat/{namespace}/rpms/{package}"
     if ref:
         await run_tool(
@@ -610,3 +745,98 @@ async def clone_and_prep_sources(
     logger.warning(f"prep failed for {package}, falling back to manual extraction: {result}")
     unpacked = await _fallback_extract_sources(local_clone, package)
     return local_clone, unpacked, False
+
+
+class InvalidConsolidationConfigError(Exception):
+    """Raised when ymir.yaml exists but the consolidation section cannot be parsed."""
+
+
+async def fetch_consolidation_config(
+    package: str,
+    available_tools: list,
+) -> PackageConsolidationConfig:
+    """Fetch the consolidation config from the per-package rules repo.
+
+    Reads the ``consolidation`` section from ``ymir.yaml`` at
+    ``gitlab.com/redhat/centos-stream/rules/<package>``.
+    Returns the default config (merge enabled) when the file is absent
+    or has no ``consolidation`` key.
+
+    Raises:
+        InvalidConsolidationConfigError: When the file exists but the
+            ``consolidation`` section does not conform to the expected schema.
+
+    Args:
+        package: RPM package name.
+        available_tools: MCP gateway tools (must include ``get_maintainer_rules``).
+
+    Returns:
+        Parsed consolidation config.
+    """
+    import yaml
+
+    try:
+        raw = await run_tool(
+            "get_maintainer_rules",
+            package=package,
+            file_path="ymir.yaml",
+            available_tools=available_tools,
+        )
+    except Exception as e:
+        logger.warning("Failed to fetch ymir.yaml for %s: %s", package, e)
+        return PackageConsolidationConfig()
+
+    if "not found" in raw.lower():
+        return PackageConsolidationConfig()
+
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        raise InvalidConsolidationConfigError(f"ymir.yaml for {package} is not valid YAML: {e}") from e
+
+    if not isinstance(data, dict) or "consolidation" not in data:
+        return PackageConsolidationConfig()
+
+    try:
+        return PackageConsolidationConfig.model_validate(data["consolidation"])
+    except Exception as e:
+        raise InvalidConsolidationConfigError(
+            f"ymir.yaml consolidation section for {package} is malformed: {e}"
+        ) from e
+
+
+async def try_submit_consolidation_job(
+    package: str,
+    dist_git_branch: str,
+    gateway_tools: list,
+    redis_conn,
+) -> None:
+    """Fetch consolidation config and submit a job if enabled.
+
+    Shared logic used by both the backport and rebuild agents after
+    creating an MR.
+
+    Raises:
+        InvalidConsolidationConfigError: When ymir.yaml exists but the
+            consolidation section is malformed.
+    """
+    config = await fetch_consolidation_config(package, gateway_tools)
+
+    if not config.merge_mrs:
+        logger.info("MR consolidation not enabled for %s, skipping", package)
+        return
+
+    if redis_conn is None:
+        logger.info("No Redis connection (direct mode), skipping consolidation job submission")
+        return
+
+    submitted = await submit_merge_job(
+        redis_conn,
+        package,
+        dist_git_branch,
+        release_strategy=config.release_strategy.value,
+    )
+    if submitted:
+        logger.info("Submitted consolidation job for %s/%s", package, dist_git_branch)
+    else:
+        logger.info("Consolidation job already queued for %s/%s", package, dist_git_branch)

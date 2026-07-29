@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import random
-import re
 import shutil
 import tempfile
 import time
@@ -17,9 +16,10 @@ from pydantic import BaseModel, Field
 from specfile import Specfile
 
 from ymir.common.base_utils import KerberosError, init_kerberos_ticket
-from ymir.common.utils import get_latest_candidate_build
-from ymir.common.version_utils import parse_zstream_branch_name
+from ymir.common.utils import get_latest_candidate_build, get_latest_z_pending_build
+from ymir.common.version_utils import is_older_zstream, parse_zstream_branch_name
 from ymir.tools.base import CloneableTool as Tool
+from ymir.tools.privileged.utils import sanitize_url
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +40,6 @@ _TRANSIENT_STDERR_PATTERNS = (
 )
 
 _T = TypeVar("_T")
-
-
-def _sanitize_url(text: str) -> str:
-    """Remove oauth2:{token}@ credentials from URLs in error messages."""
-    return re.sub(r"oauth2:[^@\s]+@", "oauth2:***@", text)
 
 
 def _is_transient_git_error(exc: Exception) -> bool:
@@ -68,7 +63,7 @@ async def _retry_transient(
                 backoff = random.uniform(0, base_delay * 2**attempt)  # noqa: S311
                 logger.warning(
                     f"{label} failed (attempt {attempt + 1}/{max_retries}): "
-                    f"{_sanitize_url(str(e))}; retrying in {backoff:.1f}s"
+                    f"{sanitize_url(str(e))}; retrying in {backoff:.1f}s"
                 )
                 await asyncio.sleep(backoff)
             else:
@@ -202,7 +197,7 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                     result=f"Z-Stream branch {branch} already exists, no need to create it"
                 )
         except Exception as e:
-            raise ToolError(f"Failed to check GitLab remote: {_sanitize_url(str(e))}") from e
+            raise ToolError(f"Failed to check GitLab remote: {sanitize_url(str(e))}") from e
         try:
             with tempfile.TemporaryDirectory() as path:
                 # Username is taken from the Kerberos principal and embedded in
@@ -226,7 +221,10 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                         "skipping push and waiting for mirror sync"
                     )
                 else:
-                    _, ref = await get_latest_candidate_build(package, branch)
+                    if await is_older_zstream(branch):
+                        _, ref = await get_latest_z_pending_build(package, branch)
+                    else:
+                        _, ref = await get_latest_candidate_build(package, branch)
                     if source_branch := self._find_source_branch(repo, branch):
                         ref = await self._find_latest_same_nvr_ref(
                             repo,
@@ -251,7 +249,7 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                     except git.exc.GitCommandError as e:
                         if not _is_transient_git_error(e):
                             raise
-                        logger.warning(f"Transient error polling GitLab mirror sync: {_sanitize_url(str(e))}")
+                        logger.warning(f"Transient error polling GitLab mirror sync: {sanitize_url(str(e))}")
                     elapsed = int(time.monotonic() - start_time)
                     logger.info(
                         f"Waiting for GitLab mirror sync of {package} branch {branch} ({elapsed}s elapsed)"
@@ -261,4 +259,4 @@ class CreateZstreamBranchTool(Tool[CreateZstreamBranchToolInput, ToolRunOptions,
                     f"The {branch} branch wasn't synced to GitLab after {SYNC_TIMEOUT} seconds"
                 )
         except Exception as e:
-            raise ToolError(f"Failed to create Z-Stream branch: {_sanitize_url(str(e))}") from e
+            raise ToolError(f"Failed to create Z-Stream branch: {sanitize_url(str(e))}") from e

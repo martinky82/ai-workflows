@@ -4,11 +4,13 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
 import aiohttp
+import gitlab
 from beeai_framework.context import RunContext
 from beeai_framework.emitter import Emitter
 from beeai_framework.tools import (
@@ -24,6 +26,7 @@ from ogr.services.gitlab.project import GitlabProject
 from ogr.services.gitlab.pull_request import GitlabPullRequest
 from pydantic import BaseModel, Field
 
+from ymir.common.base_utils import run_subprocess
 from ymir.common.models import (
     CommentReply,
     FailedPipelineJob,
@@ -35,9 +38,60 @@ from ymir.common.validators import AbsolutePath
 from ymir.tools.base import CloneableTool as Tool
 from ymir.tools.constants import AIOHTTP_TIMEOUT, YMIR_USER_AGENT
 from ymir.tools.http import aiohttp_get_with_retries
-from ymir.tools.privileged.utils import clean_stale_repositories
+from ymir.tools.privileged.utils import clean_stale_repositories, sanitize_url
 
 logger = logging.getLogger(__name__)
+
+_STDERR_HINT_MAX = 500
+
+
+def _git_subprocess_error(stderr: str | None, message: str) -> ToolError:
+    """Log a git subprocess failure at ERROR level and return a ToolError with a stderr hint."""
+    safe_stderr = sanitize_url(stderr or "")
+    hint = safe_stderr.strip()[-_STDERR_HINT_MAX:]
+    logger.error("%s\nstderr (last %d chars): %s", message, len(hint), hint)
+    return ToolError(f"{message}: {hint}" if hint else message)
+
+
+async def _run_git_cmd(
+    command: list[str],
+    *,
+    label: str,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float | None = 3600,
+) -> None:
+    """Run a git subprocess with structured logging, timing, and error handling.
+
+    Args:
+        command: The git command to execute as a list of arguments.
+        label: Human-readable description for log messages (e.g. "git fetch <url> branch=main").
+        cwd: Working directory for the subprocess.
+        env: Environment variables to pass to the subprocess.
+        timeout: Timeout in seconds, or None for no timeout.
+
+    Raises:
+        ToolError: If the command fails or times out.
+    """
+    logger.info("%s", label)
+    t0 = time.monotonic()
+    try:
+        coro = run_subprocess(command, cwd=cwd, env=env)
+        if timeout is not None:
+            returncode, _, stderr = await asyncio.wait_for(coro, timeout=timeout)
+        else:
+            returncode, _, stderr = await coro
+    except TimeoutError:
+        elapsed = time.monotonic() - t0
+        logger.error("%s timed out after %.1fs", label, elapsed)
+        raise ToolError(f"{label} timed out after {int(timeout)}s") from None
+    elapsed = time.monotonic() - t0
+    if returncode:
+        raise _git_subprocess_error(
+            stderr, f"{label} failed (exit_code={returncode}, elapsed={elapsed:.1f}s)"
+        )
+    logger.info("%s completed in %.1fs", label, elapsed)
+
 
 # GitLab access levels: Guest (10), Reporter (20), Developer (30),
 # Maintainer (40), Owner (50)
@@ -321,6 +375,10 @@ class OpenMergeRequestToolInput(BaseModel):
     description: str = Field(description="MR description")
     target: str = Field(description="Target branch (in the original repository)")
     source: str = Field(description="Source branch (in the fork)")
+    labels: list[str] | None = Field(
+        default=None,
+        description="Labels to set on the MR at creation time (atomic, avoids webhook race)",
+    )
 
 
 class OpenMergeRequestTool(
@@ -344,6 +402,25 @@ class OpenMergeRequestTool(
             creator=self,
         )
 
+    @staticmethod
+    def _create_mr(project, title, description, target, source, labels):
+        parameters = {
+            "source_branch": source,
+            "target_branch": target,
+            "title": title,
+            "description": description,
+        }
+        if labels:
+            parameters["labels"] = ",".join(labels)
+        if project.is_fork:
+            parameters["target_project_id"] = project.parent.gitlab_repo.attributes["id"]
+        target_project = project.parent if project.is_fork else project
+        try:
+            raw_mr = project.gitlab_repo.mergerequests.create(parameters)
+        except gitlab.GitlabError as ex:
+            raise GitlabAPIException() from ex
+        return GitlabPullRequest(raw_mr, target_project)
+
     async def _run(
         self,
         tool_input: OpenMergeRequestToolInput,
@@ -355,13 +432,14 @@ class OpenMergeRequestTool(
         description = tool_input.description
         target = tool_input.target
         source = tool_input.source
+        labels = tool_input.labels
         logger.info(f"Connecting to GitLab API to open merge request from fork: {fork_url}")
         project = await asyncio.to_thread(get_project, url=fork_url, token=os.getenv("GITLAB_TOKEN"))
         if not project:
             raise ToolError("Failed to get the specified fork")
         is_new_mr = True
         try:
-            pr = await asyncio.to_thread(project.create_pr, title, description, target, source)
+            pr = await asyncio.to_thread(self._create_mr, project, title, description, target, source, labels)
         except GitlabAPIException as ex:
             logger.info("Gitlab API exception: %s", ex)
             if ex.response_code == 409:
@@ -432,7 +510,9 @@ class GetInternalRhelBranchesTool(
 class CloneRepositoryToolInput(BaseModel):
     repository: str = Field(description="Repository to clone")
     branch: str | None = Field(default=None, description="Branch to clone. If omitted, all refs are fetched.")
-    clone_path: AbsolutePath = Field(description="Absolute path where to clone the repository")
+    clone_path: AbsolutePath = Field(
+        description="Absolute path under the shared /git-repos volume where to clone the repository"
+    )
 
 
 class CloneRepositoryTool(Tool[CloneRepositoryToolInput, ToolRunOptions, StringToolOutput]):
@@ -460,6 +540,13 @@ class CloneRepositoryTool(Tool[CloneRepositoryToolInput, ToolRunOptions, StringT
         repository = tool_input.repository
         branch = tool_input.branch
         clone_path = tool_input.clone_path
+
+        basepath = Path(os.getenv("GIT_REPO_BASEPATH", "/git-repos")).resolve()
+        resolved = clone_path.resolve()
+        if resolved == basepath or not resolved.is_relative_to(basepath):
+            raise ToolError(f"clone_path must be under {basepath} (the shared volume). Got: {clone_path}")
+        clone_path = resolved
+
         await clean_stale_repositories()
 
         auth_args = _get_git_auth_args(repository)
@@ -467,26 +554,37 @@ class CloneRepositoryTool(Tool[CloneRepositoryToolInput, ToolRunOptions, StringT
 
         clone_path.mkdir(parents=True, exist_ok=True)
 
+        safe_url = sanitize_url(repository)
+
         if branch:
-            proc = await asyncio.create_subprocess_exec("git", "init", cwd=clone_path, env=git_env)
-            if await proc.wait():
-                raise ToolError(f"Failed to initialize git repo at {clone_path}")
-
-            command = ["git", *auth_args, "fetch", repository, f"{branch}:refs/heads/{branch}"]
-            proc = await asyncio.create_subprocess_exec(command[0], *command[1:], cwd=clone_path, env=git_env)
-            if await proc.wait():
-                raise ToolError(f"Failed to fetch {branch} from {repository}")
-
-            proc = await asyncio.create_subprocess_exec(
-                "git", "checkout", branch, cwd=clone_path, env=git_env
+            await _run_git_cmd(
+                ["git", "init"],
+                label=f"git init {clone_path}",
+                cwd=clone_path,
+                env=git_env,
+                timeout=None,
             )
-            if await proc.wait():
-                raise ToolError(f"Failed to checkout branch {branch}")
+
+            await _run_git_cmd(
+                ["git", *auth_args, "fetch", repository, f"{branch}:refs/heads/{branch}"],
+                label=f"git fetch {safe_url} branch={branch}",
+                cwd=clone_path,
+                env=git_env,
+            )
+
+            await _run_git_cmd(
+                ["git", "checkout", branch],
+                label=f"git checkout branch={branch}",
+                cwd=clone_path,
+                env=git_env,
+                timeout=None,
+            )
         else:
-            command = ["git", *auth_args, "clone", repository, str(clone_path)]
-            proc = await asyncio.create_subprocess_exec(command[0], *command[1:], env=git_env)
-            if await proc.wait():
-                raise ToolError(f"Failed to clone {repository}")
+            await _run_git_cmd(
+                ["git", *auth_args, "clone", repository, str(clone_path)],
+                label=f"git clone {safe_url}",
+                env=git_env,
+            )
 
         return StringToolOutput(result=f"Successfully cloned the specified repository to {clone_path}")
 
@@ -521,14 +619,60 @@ class PushToRemoteRepositoryTool(Tool[PushToRemoteRepositoryToolInput, ToolRunOp
         clone_path = tool_input.clone_path
         branch = tool_input.branch
         force = tool_input.force
+        safe_url = sanitize_url(repository)
         auth_args = _get_git_auth_args(repository)
         command = ["git", *auth_args, "push", repository, branch]
         if force:
             command.append("--force")
-        proc = await asyncio.create_subprocess_exec(command[0], *command[1:], cwd=clone_path)
-        if await proc.wait():
-            raise ToolError("Failed to push to the specified repository")
-        return StringToolOutput(result=f"Successfully pushed the specified branch to {repository}")
+        await _run_git_cmd(
+            command,
+            label=f"git push {safe_url} branch={branch} force={force}",
+            cwd=clone_path,
+            timeout=None,
+        )
+        return StringToolOutput(result=f"Successfully pushed the specified branch to {safe_url}")
+
+
+class FetchBranchToolInput(BaseModel):
+    repository: str = Field(description="Remote repository URL to fetch from")
+    branch: str = Field(description="Branch name to fetch")
+    clone_path: AbsolutePath = Field(description="Absolute path to the local clone")
+
+
+class FetchBranchTool(Tool[FetchBranchToolInput, ToolRunOptions, StringToolOutput]):
+    name = "fetch_branch"
+    description = """
+    Fetches a single branch from a remote repository into a local clone.
+    The branch is created as a local ref.
+    """
+    input_schema = FetchBranchToolInput
+
+    def _create_emitter(self) -> Emitter:
+        return Emitter.root().child(
+            namespace=["tool", "gitlab", self.name],
+            creator=self,
+        )
+
+    async def _run(
+        self,
+        tool_input: FetchBranchToolInput,
+        options: ToolRunOptions | None,
+        context: RunContext,
+    ) -> StringToolOutput:
+        repository = tool_input.repository
+        branch = tool_input.branch
+        clone_path = tool_input.clone_path
+        safe_url = sanitize_url(repository)
+        auth_args = _get_git_auth_args(repository)
+        git_env = _get_mock_git_env()
+        await _run_git_cmd(
+            ["git", *auth_args, "fetch", repository, f"{branch}:refs/heads/{branch}"],
+            label=f"git fetch {safe_url} branch={branch}",
+            cwd=clone_path,
+            env=git_env,
+            timeout=None,
+        )
+        return StringToolOutput(result=f"Successfully fetched branch {branch} from {safe_url}")
 
 
 class AddMergeRequestLabelsToolInput(BaseModel):
@@ -566,6 +710,77 @@ class AddMergeRequestLabelsTool(Tool[AddMergeRequestLabelsToolInput, ToolRunOpti
             )
         except Exception as e:
             raise ToolError(f"Failed to add labels to merge request: {e}") from e
+
+
+class SetMergeRequestReviewersToolInput(BaseModel):
+    merge_request_url: str = Field(description="URL of the merge request")
+    reviewer_ids: list[int] = Field(description="List of GitLab user IDs to set as reviewers")
+
+
+class SetMergeRequestReviewersTool(Tool[SetMergeRequestReviewersToolInput, ToolRunOptions, StringToolOutput]):
+    name = "set_merge_request_reviewers"
+    description = """
+    Sets reviewers on an existing merge request.
+    """
+    input_schema = SetMergeRequestReviewersToolInput
+
+    def _create_emitter(self) -> Emitter:
+        return Emitter.root().child(
+            namespace=["tool", "gitlab", self.name],
+            creator=self,
+        )
+
+    async def _run(
+        self,
+        tool_input: SetMergeRequestReviewersToolInput,
+        options: ToolRunOptions | None,
+        context: RunContext,
+    ) -> StringToolOutput:
+        merge_request_url = tool_input.merge_request_url
+        reviewer_ids = tool_input.reviewer_ids
+        try:
+            mr = await _get_merge_request_from_url(merge_request_url)
+
+            def set_reviewers():
+                mr._raw_pr.reviewer_ids = reviewer_ids
+                mr._raw_pr.save()
+
+            await asyncio.to_thread(set_reviewers)
+            return StringToolOutput(
+                result=f"Successfully set reviewers {reviewer_ids} on merge request {merge_request_url}"
+            )
+        except Exception as e:
+            raise ToolError(f"Failed to set reviewers on merge request: {e}") from e
+
+
+class ResolveReviewersToolInput(BaseModel):
+    package: str = Field(description="RPM package name")
+    dist_git_branch: str = Field(description="Target dist-git branch")
+
+
+class ResolveReviewersTool(Tool[ResolveReviewersToolInput, ToolRunOptions, JSONToolOutput[list[int]]]):
+    name = "resolve_reviewers"
+    description = """
+    Resolve reviewer GitLab user IDs for a package from bugzilla component contacts.
+    """
+    input_schema = ResolveReviewersToolInput
+
+    def _create_emitter(self) -> Emitter:
+        return Emitter.root().child(
+            namespace=["tool", "gitlab", self.name],
+            creator=self,
+        )
+
+    async def _run(
+        self,
+        tool_input: ResolveReviewersToolInput,
+        options: ToolRunOptions | None,
+        context: RunContext,
+    ) -> JSONToolOutput[list[int]]:
+        from ymir.tools.privileged.reviewer_resolver import resolve_reviewers
+
+        reviewer_ids = await resolve_reviewers(tool_input.package, tool_input.dist_git_branch)
+        return JSONToolOutput(result=reviewer_ids)
 
 
 class AddMergeRequestCommentToolInput(BaseModel):
@@ -1164,3 +1379,114 @@ class SearchGitlabProjectMrsTool(
             from beeai_framework.tools import ToolError
 
             raise ToolError(f"Failed to search MRs in {project}: {e}") from e
+
+
+class ListProjectMergeRequestsToolInput(BaseModel):
+    project: str = Field(description="Full GitLab project path (e.g. 'redhat/centos-stream/rpms/bash')")
+    state: str | None = Field(
+        default="opened",
+        description="Filter by state: 'opened', 'closed', 'merged', or None for all",
+    )
+    target_branch: str | None = Field(
+        default=None,
+        description="Filter by target branch (e.g. 'c10s')",
+    )
+    labels: list[str] | None = Field(
+        default=None,
+        description="Filter by labels (all must be present)",
+    )
+    author_username: str | None = Field(
+        default=None,
+        description="Filter by MR author username",
+    )
+    order_by: str = Field(
+        default="created_at",
+        description="Order by field: 'created_at' or 'updated_at'",
+    )
+    sort: str = Field(default="asc", description="Sort direction: 'asc' or 'desc'")
+
+
+class ListProjectMergeRequestsTool(
+    Tool[
+        ListProjectMergeRequestsToolInput,
+        ToolRunOptions,
+        JSONToolOutput[list[dict[str, Any]]],
+    ]
+):
+    name = "list_project_merge_requests"
+    description = """
+    Lists merge requests for a GitLab project with filtering by state,
+    target branch, labels, and author. Returns MRs sorted by creation date
+    (ascending by default, i.e. oldest first).
+    Returns at most 100 MRs (single page, no pagination).
+    """
+    input_schema = ListProjectMergeRequestsToolInput
+
+    def _create_emitter(self) -> Emitter:
+        return Emitter.root().child(
+            namespace=["tool", "gitlab", self.name],
+            creator=self,
+        )
+
+    async def _run(
+        self,
+        tool_input: ListProjectMergeRequestsToolInput,
+        options: ToolRunOptions | None,
+        context: RunContext,
+    ) -> JSONToolOutput[list[dict[str, Any]]]:
+        encoded_project = quote(tool_input.project, safe="")
+        url = f"https://gitlab.com/api/v4/projects/{encoded_project}/merge_requests"
+
+        params: dict[str, str] = {
+            "order_by": tool_input.order_by,
+            "sort": tool_input.sort,
+            "per_page": "100",
+        }
+        if tool_input.state is not None:
+            params["state"] = tool_input.state
+        if tool_input.target_branch is not None:
+            params["target_branch"] = tool_input.target_branch
+        if tool_input.labels:
+            params["labels"] = ",".join(tool_input.labels)
+        if tool_input.author_username is not None:
+            params["author_username"] = tool_input.author_username
+
+        headers = _get_auth_headers(f"https://gitlab.com/{tool_input.project}")
+        logger.info(
+            "Listing MRs for project %s (state=%s, target=%s, labels=%s, author=%s)",
+            tool_input.project,
+            tool_input.state,
+            tool_input.target_branch,
+            tool_input.labels,
+            tool_input.author_username,
+        )
+
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session,
+                aiohttp_get_with_retries(session, url, headers=headers, params=params) as response,
+            ):
+                response.raise_for_status()
+                data = await response.json()
+
+            results = [
+                {
+                    "iid": mr["iid"],
+                    "url": mr["web_url"],
+                    "title": mr["title"],
+                    "description": mr.get("description", ""),
+                    "state": mr["state"],
+                    "source_branch": mr.get("source_branch", ""),
+                    "target_branch": mr.get("target_branch", ""),
+                    "author": mr.get("author", {}).get("username", ""),
+                    "created_at": mr.get("created_at"),
+                    "labels": mr.get("labels", []),
+                }
+                for mr in data
+            ]
+
+            logger.info("Found %d MR(s) for project %s", len(results), tool_input.project)
+            return JSONToolOutput(result=results)
+
+        except Exception as e:
+            raise ToolError(f"Failed to list MRs for {tool_input.project}: {e}") from e

@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urljoin
 
@@ -33,6 +34,7 @@ import requests
 from ymir.common.base_utils import fix_await, get_jira_auth_headers, redis_client
 from ymir.common.constants import JIRA_SEARCH_PATH, JiraLabels, RedisQueues
 from ymir.common.logging_setup import configure_logging
+from ymir.common.merge_queue import submit_merge_job
 from ymir.common.models import (
     BackportOutputSchema,
     ErrorData,
@@ -41,6 +43,7 @@ from ymir.common.models import (
     Task,
     TriageInputSchema,
 )
+from ymir.common.version_utils import construct_internal_branch_name, parse_rhel_version
 
 configure_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -58,6 +61,21 @@ class JiraIssueFetcher:
     API_TIMEOUT = 90  # 90 seconds timeout
     MODULAR_COMPONENT_PATTERN = re.compile(r".+:.+/.+")
 
+    # "In-flight" labels: each marks an issue as currently being worked on by
+    # an agent. If an agent crashes (SIGKILL/OOM) after setting one of these
+    # but before reaching the label write that replaces it with an outcome,
+    # the label is stuck forever and the fetcher skips the issue on every
+    # subsequent sweep — this is the bug the staleness check below guards
+    # against. (Planned redeployments are instead handled instantly by the
+    # SIGTERM handler in run_task_loop; this is the safety net for everything
+    # else.)
+    IN_FLIGHT_LABELS = (
+        JiraLabels.TRIAGE_IN_PROGRESS.value,
+        JiraLabels.TRIAGED_BACKPORT.value,
+        JiraLabels.TRIAGED_REBASE.value,
+        JiraLabels.TRIAGED_REBUILD.value,
+    )
+
     def __init__(self):
         self.jira_url = os.environ["JIRA_URL"]
         self.redis_url = os.environ["REDIS_URL"]
@@ -74,6 +92,17 @@ class JiraIssueFetcher:
 
         # Use constant page size
         self.max_results_per_page = self.MAX_RESULTS_PER_PAGE
+
+        # Staleness threshold for the in-flight-label safety net (see
+        # IN_FLIGHT_LABELS above). Conservative default pending real task
+        # duration data from Phoenix traces (http://localhost:6006/) — the
+        # longest documented single phase today is the 3h post-push testing
+        # window (POST_PUSH_TESTING_TIMEOUT), and a full task can involve
+        # several such phases plus retries, so 24h leaves comfortable margin
+        # while still being far short of "stuck forever". Too aggressive a
+        # value risks a false-positive re-enqueue of a still-running task —
+        # two agents processing the same issue concurrently.
+        self.stale_label_threshold_hours = float(os.getenv("STALE_LABEL_THRESHOLD_HOURS", "24"))
 
         self.headers = get_jira_auth_headers()
 
@@ -146,6 +175,30 @@ class JiraIssueFetcher:
         response = requests.put(url, json=payload, headers=self.headers, timeout=self.API_TIMEOUT)
         if response.status_code == 429:
             logger.warning(f"Rate limited (429) editing labels on {issue_key}, will retry")
+            raise requests.HTTPError("Rate limited", response=response)
+        response.raise_for_status()
+
+    @backoff.on_exception(
+        backoff.expo,
+        (requests.RequestException, requests.HTTPError),
+        max_tries=4,
+        base=2,
+        logger=logger,
+    )
+    def _post_jira_comment(self, issue_key: str, comment: str) -> None:
+        """Post a private comment to a Jira issue."""
+        url = urljoin(self.jira_url, f"rest/api/3/issue/{issue_key}/comment")
+        payload = {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
+            },
+            "visibility": {"type": "group", "value": "Red Hat Employee"},
+        }
+        response = requests.post(url, json=payload, headers=self.headers, timeout=self.API_TIMEOUT)
+        if response.status_code == 429:
+            logger.warning(f"Rate limited (429) posting comment on {issue_key}, will retry")
             raise requests.HTTPError("Rate limited", response=response)
         response.raise_for_status()
 
@@ -253,6 +306,60 @@ class JiraIssueFetcher:
             )
             return False
 
+    @staticmethod
+    def _is_label_stale(issue: dict[str, Any], threshold_hours: float) -> bool:
+        """Check whether `issue`'s bulk-fetched `fields.updated` timestamp is
+        older than `threshold_hours`.
+
+        Uses data already in hand from the bulk search — no extra per-issue
+        Jira API calls, so this scales to the full sweep with zero added
+        load. This is intentionally coarser than "when was this specific
+        label added": any field update (e.g. an unrelated human comment)
+        resets `updated` too. Acceptable for a best-effort safety net —
+        false negatives (staleness masked by an unrelated update) just wait
+        for the next sweep, which is safe.
+
+        Returns False (not stale) if `updated` is missing or unparseable,
+        since we can't tell without it — fails closed to the current
+        "always skip" behavior rather than risking a false-positive
+        re-enqueue of still-running work.
+        """
+        updated_str = (issue.get("fields") or {}).get("updated")
+        if not updated_str:
+            return False
+        try:
+            updated = datetime.fromisoformat(updated_str)
+        except ValueError:
+            return False
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=UTC)
+        return datetime.now(UTC) - updated > timedelta(hours=threshold_hours)
+
+    def _find_stale_in_flight_label(self, issue: dict[str, Any], ymir_labels: list[str]) -> str | None:
+        """Return the in-flight label on `issue` if it looks abandoned, else None.
+
+        "Abandoned" means: one of IN_FLIGHT_LABELS is present, no other Ymir
+        label coexists with it (the same signal triage_agent's own dedup
+        check uses to decide a stage already produced an outcome — see
+        triage_agent.py's `terminal_ymir_labels` check), and the issue hasn't
+        been updated in over `stale_label_threshold_hours`. A coexisting
+        label means either the outcome label was written but the in-flight
+        one wasn't cleaned up (not actually stuck), or it's an orthogonal
+        label from an unrelated workflow (e.g. ymir_consolidate_base) — in
+        both cases we can't be confident it's abandoned, so we leave it
+        alone rather than risk a false-positive re-enqueue.
+        """
+        ignorable = {JiraLabels.RETRY_NEEDED.value, JiraLabels.TODO.value}
+        for label in self.IN_FLIGHT_LABELS:
+            if label not in ymir_labels:
+                continue
+            other_labels = [ol for ol in ymir_labels if ol != label and ol not in ignorable]
+            if other_labels:
+                continue
+            if self._is_label_stale(issue, self.stale_label_threshold_hours):
+                return label
+        return None
+
     async def search_issues(self) -> list[dict[str, Any]]:
         """
         Search for issues using the configured query with cursor-based pagination.
@@ -268,6 +375,8 @@ class JiraIssueFetcher:
             "labels",  # Issue labels
             "components",  # Issue components
             "customfield_10669",  # Downstream Component Name
+            "fixVersions",  # Fix Version/s (e.g., rhel-9.8)
+            "updated",  # Last-modified timestamp — used for stale in-flight-label detection
         ]
 
         while True:
@@ -486,6 +595,55 @@ class JiraIssueFetcher:
                     user_triggered_keys.add(issue_key)
                     continue
 
+                # Safety net for tasks lost to a hard crash/OOM/SIGKILL (planned
+                # redeployments are instead recovered instantly by the SIGTERM
+                # handler in run_task_loop, which re-pushes the original Redis
+                # payload — unavailable here). Flip the stuck in-flight label to
+                # ymir_retry_needed so the existing retry_needed handling below
+                # re-triages the issue from scratch — the only generically
+                # correct recovery path, since the original downstream Task
+                # payload (package, patch_urls, target_branch, etc.) only ever
+                # existed in the now-unrecoverable Redis message.
+                stale_label = self._find_stale_in_flight_label(issue, ymir_labels)
+                if stale_label and issue_key in existing_keys:
+                    # The label looks abandoned, but its payload is still sitting in a
+                    # live Redis queue (e.g. the SIGTERM handler already re-pushed it,
+                    # or a downstream queue is simply backed up — ymir_triaged_backport
+                    # et al. legitimately persist for as long as the task waits to be
+                    # picked up). Flipping to ymir_retry_needed here would bypass the
+                    # existing_keys guard below and LPUSH a second, duplicate task on
+                    # top of the one already queued. Leave it - it'll drain naturally,
+                    # and if it's genuinely stuck the next sweep will re-check.
+                    logger.info(
+                        f"Issue {issue_key} has stale {stale_label} but its task is "
+                        f"still queued in Redis - not treating as abandoned"
+                    )
+                elif stale_label:
+                    logger.warning(
+                        f"Issue {issue_key} has stale {stale_label} (no update in "
+                        f">{self.stale_label_threshold_hours}h, no other Ymir label) - "
+                        f"treating as abandoned and flipping to {JiraLabels.RETRY_NEEDED.value}"
+                    )
+                    if self.dry_run:
+                        logger.info(
+                            f"DRY_RUN: would flip {stale_label} -> "
+                            f"{JiraLabels.RETRY_NEEDED.value} on {issue_key}"
+                        )
+                    else:
+                        try:
+                            self._edit_jira_labels(
+                                issue_key,
+                                add=[JiraLabels.RETRY_NEEDED.value],
+                                remove=[stale_label],
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to flip stale {stale_label} on {issue_key}: {e}")
+                            existing_keys.add(issue_key)
+                            continue
+                    remove_issues_for_retry.add(issue_key)
+                    retry_needed_keys.add(issue_key)
+                    continue
+
                 # If issue has Ymir labels and there is no ymir_retry_needed label, mark as existing
                 if ymir_labels and JiraLabels.RETRY_NEEDED.value not in ymir_labels:
                     existing_keys.add(issue_key)
@@ -596,6 +754,158 @@ class JiraIssueFetcher:
                 logger.info(f"Skipped {modular_count} modular issues")
             return pushed_count
 
+    @staticmethod
+    def _resolve_branch_from_fix_versions(fix_versions: list[dict]) -> str | None:
+        """Derive dist-git branch name from Jira fixVersions.
+
+        Returns the internal branch (e.g. ``rhel-9.8.0``) or None.
+        """
+        for fv in fix_versions:
+            name = fv.get("name", "")
+            parsed = parse_rhel_version(name)
+            if parsed:
+                major, minor, _is_zstream = parsed
+                return construct_internal_branch_name(major, minor)
+        return None
+
+    async def _process_consolidation_labels(
+        self,
+        issues: list[dict[str, Any]],
+    ) -> int:
+        """Scan for ymir_consolidate_base / _next label pairs and submit targeted jobs.
+
+        Returns the number of consolidation jobs submitted.
+        """
+        base_bucket: dict[str, dict] = {}
+        next_bucket: dict[str, dict] = {}
+
+        for issue in issues:
+            issue_key = issue.get("key")
+            if not issue_key:
+                continue
+            fields = issue.get("fields", {})
+            labels = fields.get("labels", [])
+
+            is_base = JiraLabels.CONSOLIDATE_BASE.value in labels
+            is_next = JiraLabels.CONSOLIDATE_NEXT.value in labels
+            if not is_base and not is_next:
+                continue
+
+            components = [c.get("name") for c in (fields.get("components") or []) if c.get("name")]
+            if not components:
+                logger.warning(
+                    "Issue %s has consolidation label but no component, skipping",
+                    issue_key,
+                )
+                continue
+            component = components[0]
+
+            fix_versions = fields.get("fixVersions", [])
+            branch = self._resolve_branch_from_fix_versions(fix_versions)
+            if not branch:
+                logger.warning(
+                    "Issue %s has consolidation label but no resolvable fixVersion (%s), skipping",
+                    issue_key,
+                    fix_versions,
+                )
+                continue
+
+            bucket_key = f"{component}:{branch}"
+            entry = {"key": issue_key, "component": component, "branch": branch}
+            if is_base:
+                base_bucket[bucket_key] = entry
+            if is_next:
+                next_bucket[bucket_key] = entry
+
+        submitted = 0
+        async with redis_client(self.redis_url) as redis_conn:
+            for bucket_key, base_entry in base_bucket.items():
+                next_entry = next_bucket.pop(bucket_key, None)
+                if not next_entry:
+                    logger.warning(
+                        "Issue %s has %s but no matching %s for %s",
+                        base_entry["key"],
+                        JiraLabels.CONSOLIDATE_BASE.value,
+                        JiraLabels.CONSOLIDATE_NEXT.value,
+                        bucket_key,
+                    )
+                    continue
+
+                package = base_entry["component"]
+                branch = base_entry["branch"]
+                base_key = base_entry["key"]
+                next_key = next_entry["key"]
+
+                try:
+                    result = await submit_merge_job(
+                        redis_conn,
+                        package,
+                        branch,
+                        source_issues=[base_key, next_key],
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to submit consolidation job for %s/%s (%s, %s): %s",
+                        package,
+                        branch,
+                        base_key,
+                        next_key,
+                        e,
+                    )
+                    continue
+
+                if not result:
+                    logger.info(
+                        "Consolidation job already queued for %s/%s, removing labels anyway",
+                        package,
+                        branch,
+                    )
+
+                for issue_key, label in [
+                    (base_key, JiraLabels.CONSOLIDATE_BASE.value),
+                    (next_key, JiraLabels.CONSOLIDATE_NEXT.value),
+                ]:
+                    if self.dry_run:
+                        logger.info("DRY_RUN: would remove %s from %s", label, issue_key)
+                    else:
+                        try:
+                            self._edit_jira_labels(issue_key, add=[], remove=[label])
+                        except Exception as e:
+                            logger.warning("Failed to remove %s from %s: %s", label, issue_key, e)
+
+                    comment = (
+                        f"MR consolidation job submitted for {package}/{branch}. "
+                        f"The backport MRs for {base_key} and {next_key} will be "
+                        f"consolidated into a single MR."
+                    )
+                    if self.dry_run:
+                        logger.info("DRY_RUN: would post comment on %s", issue_key)
+                    else:
+                        try:
+                            self._post_jira_comment(issue_key, comment)
+                        except Exception as e:
+                            logger.warning("Failed to post comment on %s: %s", issue_key, e)
+
+                submitted += 1
+                logger.info(
+                    "Submitted consolidation job for %s/%s (issues: %s, %s)",
+                    package,
+                    branch,
+                    base_key,
+                    next_key,
+                )
+
+        for bucket_key, next_entry in next_bucket.items():
+            logger.warning(
+                "Issue %s has %s but no matching %s for %s",
+                next_entry["key"],
+                JiraLabels.CONSOLIDATE_NEXT.value,
+                JiraLabels.CONSOLIDATE_BASE.value,
+                bucket_key,
+            )
+
+        return submitted
+
     async def run(self) -> None:
         try:
             logger.info("Starting Jira issue fetcher")
@@ -607,8 +917,11 @@ class JiraIssueFetcher:
                 return
 
             pushed_count = await self.push_issues_to_queue(issues)
-
             logger.info(f"Completed: {pushed_count} issues added to triage_queue")
+
+            consolidation_count = await self._process_consolidation_labels(issues)
+            if consolidation_count:
+                logger.info(f"Submitted {consolidation_count} MR consolidation job(s)")
 
         except Exception as e:
             logger.error(f"Fatal error in issue fetcher: {e}")

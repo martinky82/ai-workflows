@@ -72,6 +72,7 @@ For installation instructions (skill setup and MCP tool configuration), see the 
 - [Brew/Konflux Build System Data Flow](brew_konflux_data_flow.md) - Build system integration
 - [AI Providers Data Flow](ai_providers_data_flow.md) - Google Vertex AI integration and model usage
 - [Agent Monitoring and Performance Review](monitoring.md) - Monitoring processes, anomaly detection, and continuous improvement
+- [MR Consolidation Architecture](docs/mr_consolidation_architecture.md) - Merging multiple backport MRs into a single MR
 
 **Data management:**
 
@@ -115,7 +116,10 @@ internal-only packages.
 **Questions or issues with the agents?**
 
 - **Email**: redhat-ymir-agent@redhat.com
-- **Slack**: #forum-ymir-package-automation
+- **Slack Forum**: [#forum-ymir-package-automation](https://redhat.enterprise.slack.com/archives/C095699FLMR)
+
+  If you have suggestions or complaints, please reach out to us on the forum where your feedback will be more visible than pinging us on individual issues.
+
 - **Report AI Issues**: [Jira Issues](https://issues.redhat.com/) (project: Packit, component: jotnar) or [GitHub Issues](https://github.com/packit/ai-workflows/issues)
 
   If you encounter incorrect backports, hallucinations, or other AI-related problems, please file a Jira or GitHub issue.

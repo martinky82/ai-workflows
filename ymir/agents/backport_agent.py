@@ -24,12 +24,18 @@ from specfile import Specfile
 import ymir.agents.tasks as tasks
 from ymir.agents.build_agent import create_build_agent
 from ymir.agents.build_agent import get_prompt as get_build_prompt
-from ymir.agents.constants import I_AM_YMIR, mr_description_footer
+from ymir.agents.constants import (
+    I_AM_YMIR,
+    ZSTREAM_TARGET_LABEL,
+    format_jira_links_for_mr,
+    mr_description_footer,
+)
 from ymir.agents.log_agent import create_log_agent
 from ymir.agents.log_agent import get_prompt as get_log_prompt
 from ymir.agents.observability import setup_observability
 from ymir.agents.package_update_steps import PackageUpdateState
 from ymir.agents.reasoning_agent import ReasoningAgent
+from ymir.agents.tasks import InvalidConsolidationConfigError
 from ymir.agents.utils import (
     check_subprocess,
     format_mr_triage_details,
@@ -44,7 +50,7 @@ from ymir.agents.utils import (
     run_tool,
     wrap_details,
 )
-from ymir.common.base_utils import fix_await, redis_client, run_task_loop
+from ymir.common.base_utils import fix_await, install_shutdown_handler, redis_client, run_task_loop
 from ymir.common.constants import JiraLabels, RedisQueues
 from ymir.common.logging_setup import configure_logging, current_jira_issue, get_trajectory_writeable
 from ymir.common.mock_repos import get_mock_local_tool_env
@@ -312,6 +318,7 @@ async def run_workflow(
     max_build_attempts=10,
     max_incremental_fix_attempts=None,
     user_triggered=False,
+    dist_git_namespace=None,
 ):
     if max_incremental_fix_attempts is None:
         max_incremental_fix_attempts = max_build_attempts
@@ -364,6 +371,7 @@ async def run_workflow(
                 package=state.package,
                 dist_git_branch=state.dist_git_branch,
                 available_tools=gateway_tools,
+                dist_git_namespace=state.dist_git_namespace,
             )
             local_tool_options["working_directory"] = state.local_clone
             await run_tool(
@@ -698,19 +706,60 @@ async def run_workflow(
                         f"{state.log_result.description}\n\n"
                         f"Upstream patches:\n{formatted_patches}\n\n"
                         f"{triage_details_text}"
-                        f"Resolves: {state.jira_issue}\n\n"
+                        f"{format_jira_links_for_mr(state.jira_issue)}\n"
                         f"{wrap_details('Backporting steps', state.backport_log[-1])}"
                         f"\n\n{mr_description_footer(state.package)}"
                     ),
                     available_tools=gateway_tools,
                     commit_only=dry_run,
-                    labels=["ymir_backport"],
+                    labels=["ymir_backport"]
+                    + (
+                        [ZSTREAM_TARGET_LABEL]
+                        if await tasks.needs_zstream_target_label(state.dist_git_branch, state.fix_version)
+                        else []
+                    ),
+                    package=state.package,
                 )
             except Exception as e:
                 logger.warning(f"Error committing and opening MR: {e}")
                 state.merge_request_url = None
                 state.backport_result.success = False
                 state.backport_result.error = f"Could not commit and open MR: {e}"
+            return "submit_consolidation_job"
+
+        async def submit_consolidation_job(state):
+            if (
+                not state.merge_request_url
+                or not state.backport_result
+                or not state.backport_result.success
+                or not state.merge_request_newly_created
+            ):
+                return "comment_in_jira"
+
+            try:
+                await tasks.try_submit_consolidation_job(
+                    state.package,
+                    state.dist_git_branch,
+                    gateway_tools,
+                    redis_conn,
+                )
+            except InvalidConsolidationConfigError as e:
+                logger.warning("Invalid consolidation config for %s: %s", state.package, e)
+                await tasks.comment_in_jira(
+                    jira_issue=state.jira_issue,
+                    agent_type="Backport",
+                    comment_text=(
+                        f"ymir.yaml for {state.package} has a malformed consolidation "
+                        f"section: {e}\n\nMR consolidation was skipped. Please fix "
+                        f"the config file in the rules repository."
+                    ),
+                    is_error=True,
+                    available_tools=gateway_tools,
+                    user_triggered=user_triggered,
+                )
+            except Exception as e:
+                logger.warning("Failed to submit consolidation job: %s", e)
+
             return "comment_in_jira"
 
         async def comment_in_jira(state):
@@ -744,12 +793,14 @@ async def run_workflow(
         workflow.add_step("stage_changes", stage_changes)
         workflow.add_step("run_log_agent", run_log_agent)
         workflow.add_step("commit_push_and_open_mr", commit_push_and_open_mr)
+        workflow.add_step("submit_consolidation_job", submit_consolidation_job)
         workflow.add_step("comment_in_jira", comment_in_jira)
 
         response = await workflow.run(
             BackportState(
                 package=package,
                 dist_git_branch=dist_git_branch,
+                dist_git_namespace=dist_git_namespace,
                 upstream_patches=upstream_patches,
                 jira_issue=jira_issue,
                 cve_id=cve_id,
@@ -782,7 +833,7 @@ async def main() -> None:
     ):
         upstream_patches = upstream_patches_raw.split(",")
         logger.info("Running in direct mode with environment variables")
-        with span_processor.start_transaction(jira_issue, workflow="backport"):
+        with span_processor.start_transaction(jira_issue, workflow="BackportWorkflow"):
             state = await run_workflow(
                 package=package,
                 dist_git_branch=branch,
@@ -824,6 +875,7 @@ async def main() -> None:
             backport_data = BackportData.model_validate(triage_state["triage_result"]["data"])
             current_jira_issue.set(backport_data.jira_issue)
             dist_git_branch = triage_state["target_branch"]
+            dist_git_namespace = triage_state.get("dist_git_namespace")
             user_triggered = task.user_triggered
             logger.info(
                 f"Processing backport for package: {backport_data.package}, "
@@ -884,7 +936,7 @@ async def main() -> None:
 
             try:
                 logger.info(f"Starting backport processing for {backport_data.jira_issue}")
-                with span_processor.start_transaction(backport_data.jira_issue, workflow="backport"):
+                with span_processor.start_transaction(backport_data.jira_issue, workflow="BackportWorkflow"):
                     state = await run_workflow(
                         package=backport_data.package,
                         dist_git_branch=dist_git_branch,
@@ -899,6 +951,7 @@ async def main() -> None:
                         max_build_attempts=max_build_attempts,
                         max_incremental_fix_attempts=max_incremental_fix_attempts,
                         user_triggered=user_triggered,
+                        dist_git_namespace=dist_git_namespace,
                     )
                     logger.info(
                         f"Backport processing completed for {backport_data.jira_issue}, "
@@ -959,11 +1012,14 @@ async def main() -> None:
                         ).model_dump_json(),
                     )
 
+        shutdown_event = asyncio.Event()
+        install_shutdown_handler(asyncio.get_running_loop(), shutdown_event)
         await run_task_loop(
             redis,
             [backport_queue_todo, backport_queue],
             process_task,
             max_concurrent=max_concurrent_tasks,
+            shutdown_event=shutdown_event,
         )
 
 

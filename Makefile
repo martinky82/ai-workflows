@@ -47,8 +47,16 @@ run-triage-agent-standalone:
 		-e FORCE_CVE_TRIAGE=$(FORCE_CVE_TRIAGE) \
 		triage-agent
 
-.PHONY: run-triage-agent-e2e-tests
+.PHONY: run-triage-agent-e2e-tests list-triage-agent-e2e-tests
 run-triage-agent-e2e-tests:
+	@if [ -n "$(TMT_PLAN_DATA)" ]; then \
+		mv $(TMT_PLAN_DATA)/mock_repos/* ymir/agents/tests/e2e/mock_repos/; \
+		mv $(TMT_PLAN_DATA)/jiras/* ymir/tools/privileged/tests/data/; \
+		mv $(TMT_PLAN_DATA)/.secrets .secrets; \
+		mv .secrets/.env ./; \
+	else \
+		touch .tmt/results.yaml; \
+	fi
 	# SAFETY: MOCK_JIRA=true and DRY_RUN=true prevent writes to production Jira.
 	# These are REQUIRED — tests use real issue keys and would otherwise post
 	# comments to production. Setting them in the environment (not just -e flags)
@@ -58,6 +66,12 @@ run-triage-agent-e2e-tests:
 		-e MOCK_JIRA="true" \
 		-e DRY_RUN="true" \
 		triage-agent-e2e-tests
+
+list-triage-agent-e2e-tests:
+	MOCK_JIRA=true DRY_RUN=true $(COMPOSE) -f $(COMPOSE_FILE) --profile=e2e-test run --rm \
+		-e MOCK_JIRA="true" \
+		-e DRY_RUN="true" \
+		triage-agent-e2e-tests pytest ymir/agents/tests/e2e/test_triage.py --collect-only
 
 .PHONY: run-backport-agent-e2e-tests
 run-backport-agent-e2e-tests:
@@ -183,6 +197,23 @@ run-mr-agent-c10s-standalone:
 .PHONY: run-mr-agent-standalone
 run-mr-agent-standalone: run-mr-agent-c10s-standalone
 
+.PHONY: run-mr-consolidation-agent-standalone
+run-mr-consolidation-agent-standalone:
+	$(COMPOSE_AGENTS) run --rm \
+		-e PACKAGE=$(PACKAGE) \
+		-e BRANCH=$(BRANCH) \
+		-e RELEASE_STRATEGY=$(RELEASE_STRATEGY) \
+		-e DRY_RUN=$(DRY_RUN) \
+		mr-consolidation-agent-c10s
+
+.PHONY: run-mr-consolidation-agent-e2e-tests
+run-mr-consolidation-agent-e2e-tests:
+	$(COMPOSE) -f $(COMPOSE_FILE) --profile=e2e-test run --rm \
+		-e MOCK_JIRA="true" \
+		-e DRY_RUN="true" \
+		-e RUN_LLM_JUDGE=$(RUN_LLM_JUDGE) \
+		mr-consolidation-agent-e2e-tests
+
 
 .PHONY: run-jira-issue-fetcher
 run-jira-issue-fetcher:
@@ -201,6 +232,42 @@ run-jira-issue-fetcher:
 .PHONY: build-jira-issue-fetcher
 build-jira-issue-fetcher:
 	$(COMPOSE) --profile manual build jira-issue-fetcher
+
+.PHONY: build-mr-cleanup
+build-mr-cleanup:
+	$(COMPOSE) --profile manual build mr-cleanup
+
+# Usage:
+#   make run-mr-cleanup-dry-run    # dry run, lists what would be closed
+#   make run-mr-cleanup            # live run, closes MRs
+#   TARGET_MR=<url> make run-mr-cleanup-dry-run   # dry run on single MR
+#   TARGET_MR=<url> make run-mr-cleanup           # live run on single MR
+define mr-cleanup-check-env
+	@if [ ! -f .secrets/mr-cleanup.env ]; then \
+		echo "Error: .secrets/mr-cleanup.env not found"; \
+		echo "Copy the template: cp templates/mr-cleanup.env .secrets/mr-cleanup.env"; \
+		echo "Then edit it with your credentials"; \
+		exit 1; \
+	fi
+endef
+
+.PHONY: run-mr-cleanup-dry-run
+run-mr-cleanup-dry-run:
+	$(mr-cleanup-check-env)
+	@echo "Running MR Cleanup (dry run)..."
+	$(COMPOSE) -f $(COMPOSE_FILE) --profile manual run --rm \
+		-e DRY_RUN=true \
+		$(if $(TARGET_MR),-e TARGET_MR=$(TARGET_MR)) \
+		mr-cleanup
+
+.PHONY: run-mr-cleanup
+run-mr-cleanup:
+	$(mr-cleanup-check-env)
+	@echo "Running MR Cleanup (LIVE — will close MRs and post comments)..."
+	$(COMPOSE) -f $(COMPOSE_FILE) --profile manual run --rm \
+		-e DRY_RUN=false \
+		$(if $(TARGET_MR),-e TARGET_MR=$(TARGET_MR)) \
+		mr-cleanup
 
 
 
@@ -240,6 +307,10 @@ logs-rebase:
 .PHONY: logs-rebuild
 logs-rebuild:
 	$(COMPOSE_AGENTS) logs -f rebuild-agent
+
+.PHONY: logs-mr-consolidation
+logs-mr-consolidation:
+	$(COMPOSE_AGENTS) logs -f mr-consolidation-agent-c9s mr-consolidation-agent-c10s
 
 .PHONY: logs-jira-issue-fetcher
 logs-jira-issue-fetcher:

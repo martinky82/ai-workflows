@@ -424,6 +424,53 @@ class TestCloneUpstreamRepositoryTool:
                 )
             ).middleware(GlobalTrajectoryMiddleware(pretty=True))
 
+        assert not (tmp_path / "mypackage-upstream").exists()
+
+    @pytest.mark.asyncio
+    async def test_clone_passes_blobless_filter(self, tool, tmp_path):
+        clone_dir = tmp_path / "mypackage"
+        expected_path = tmp_path / "mypackage-upstream"
+        captured_cmd = []
+
+        async def mock_run_subprocess(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            expected_path.mkdir(parents=True, exist_ok=True)
+            (expected_path / ".git").mkdir(exist_ok=True)
+            return (0, "", "")
+
+        flexmock(upstream_tools_mod).should_receive("run_subprocess").replace_with(mock_run_subprocess).once()
+
+        await tool.run(
+            input=CloneUpstreamRepositoryToolInput(
+                repo_url="https://github.com/owner/repo.git",
+                clone_directory=str(clone_dir),
+            )
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "--filter=blob:none" in captured_cmd
+
+    @pytest.mark.asyncio
+    async def test_clone_timeout_removes_partial_directory(self, tool, tmp_path, monkeypatch):
+        clone_dir = tmp_path / "mypackage"
+        expected_path = tmp_path / "mypackage-upstream"
+
+        async def mock_wait_for(coro, timeout):
+            expected_path.mkdir(parents=True, exist_ok=True)
+            coro.close()
+            raise TimeoutError
+
+        monkeypatch.setattr(upstream_tools_mod.asyncio, "wait_for", mock_wait_for)
+
+        with pytest.raises(ToolError, match="Clone timed out"):
+            await tool.run(
+                input=CloneUpstreamRepositoryToolInput(
+                    repo_url="https://github.com/owner/repo.git",
+                    clone_directory=str(clone_dir),
+                )
+            ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert not expected_path.exists()
+
 
 # ---------------------------------------------------------------------------
 # FindBaseCommitTool
@@ -441,6 +488,21 @@ class TestFindBaseCommitTool:
         subprocess.run(["git", "commit", "-m", "Initial"], cwd=repo, check=True)
         subprocess.run(["git", "tag", "v1.2.3"], cwd=repo, check=True)
         subprocess.run(["git", "tag", "release-2.0.0"], cwd=repo, check=True)
+        return repo
+
+    @staticmethod
+    def _make_repo(tmp_path, dir_name, tags):
+        """Create a git repo at tmp_path/dir_name with the given tags."""
+        repo = tmp_path / dir_name
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        (repo / "file.c").write_text("int main() {}\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial"], cwd=repo, check=True)
+        for tag in tags:
+            subprocess.run(["git", "tag", tag], cwd=repo, check=True)
         return repo
 
     @pytest.fixture
@@ -500,16 +562,120 @@ class TestFindBaseCommitTool:
         assert tool.options["base_tag_commit"] == head
 
     @pytest.mark.asyncio
-    async def test_no_matching_tag_raises_with_available_tags(self, tool, upstream_repo):
-        with pytest.raises(ToolError, match=r"Could not find tag matching version 99\.99\.99") as exc_info:
-            await tool.run(
-                input=FindBaseCommitToolInput(
-                    repo_path=str(upstream_repo),
-                    version="99.99.99",
-                )
-            ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+    async def test_no_matching_tag_returns_soft_failure(self, tool, upstream_repo):
+        result = await tool.run(
+            input=FindBaseCommitToolInput(
+                repo_path=str(upstream_repo),
+                version="99.99.99",
+            )
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
 
-        assert "v1.2.3" in exc_info.value.message
+        assert "Could not find tag matching version 99.99.99" in result.result
+        assert "v1.2.3" in result.result
+        assert "Retry with" in result.result
+        assert "base_tag_commit" not in tool.options
+
+    @pytest.mark.asyncio
+    async def test_finds_curl_style_tag(self, tmp_path):
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        repo = self._make_repo(tmp_path, "curl-upstream", ["curl-7_76_1"])
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="7.76.1")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "curl-7_76_1" in result.result
+        assert "base_tag_commit" in tool.options
+
+    @pytest.mark.asyncio
+    async def test_finds_openssh_style_tag(self, tmp_path):
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        repo = self._make_repo(tmp_path, "openssh-upstream", ["V_9_9_P1"])
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="9.9p1")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "V_9_9_P1" in result.result
+        assert "base_tag_commit" in tool.options
+
+    @pytest.mark.asyncio
+    async def test_finds_postgresql_style_tag(self, tmp_path):
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        repo = self._make_repo(tmp_path, "postgresql-upstream", ["REL_16_11"])
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="16.11")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "REL_16_11" in result.result
+        assert "base_tag_commit" in tool.options
+
+    @pytest.mark.asyncio
+    async def test_finds_gnutls_style_tag(self, tmp_path):
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        repo = self._make_repo(tmp_path, "gnutls-upstream", ["gnutls_3_6_2"])
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="3.6.2")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "gnutls_3_6_2" in result.result
+        assert "base_tag_commit" in tool.options
+
+    @pytest.mark.asyncio
+    async def test_finds_pkgname_dotted_tag(self, tmp_path):
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        repo = self._make_repo(tmp_path, "mylib-upstream", ["mylib-2.0.0"])
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="2.0.0")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "mylib-2.0.0" in result.result
+        assert "base_tag_commit" in tool.options
+
+    @pytest.mark.asyncio
+    async def test_smart_tag_listing_shows_relevant_tags(self, tmp_path):
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        tags = ["curl-7_76_1", "curl-8_0_0", "curl-8_1_0", "unrelated-tag"]
+        repo = self._make_repo(tmp_path, "upstream", tags)
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="7.76.1")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "Tags matching version components" in result.result
+        assert "curl-7_76_1" in result.result
+
+    @pytest.mark.asyncio
+    async def test_v_prefixed_tag_wins_over_pkgname_pattern(self, tmp_path):
+        """Generic patterns are tried before package-name patterns."""
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        repo = self._make_repo(tmp_path, "curl-upstream", ["v7.76.1", "curl-7_76_1"])
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="7.76.1")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "v7.76.1" in result.result
+
+    @pytest.mark.asyncio
+    async def test_finds_versioned_package_tag(self, tmp_path):
+        """RHEL versioned packages like nodejs22 strip trailing digits to match tags like nodejs-20_11_0."""
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        repo = self._make_repo(tmp_path, "nodejs22-upstream", ["nodejs-20_11_0"])
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="20.11.0")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "nodejs-20_11_0" in result.result
+        assert "base_tag_commit" in tool.options
+
+    @pytest.mark.asyncio
+    async def test_no_pkg_name_without_upstream_suffix(self, tmp_path):
+        """Repos without -upstream suffix skip package-name patterns."""
+        tool = FindBaseCommitTool(options={"working_directory": None})
+        repo = self._make_repo(tmp_path, "somerepo", ["somerepo-1_0_0"])
+        result = await tool.run(
+            input=FindBaseCommitToolInput(repo_path=str(repo), version="1.0.0")
+        ).middleware(GlobalTrajectoryMiddleware(pretty=True))
+
+        assert "Could not find tag" in result.result
+        assert "somerepo-1_0_0" in result.result
 
     @pytest.mark.asyncio
     async def test_not_a_git_repo(self, tool, tmp_path):

@@ -45,9 +45,9 @@ spec:
           protocol: TCP
         resources:
           limits:
-            memory: 1Gi
+            memory: 3Gi
           requests:
-            memory: 512Mi
+            memory: 1536Mi
         terminationMessagePath: /dev/termination-log
         terminationMessagePolicy: File
         volumeMounts:
@@ -67,7 +67,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       # TODO: this should be reset when we have enough data.
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 45
       volumes:
       - name: mcp-server-git-repos
         persistentVolumeClaim:

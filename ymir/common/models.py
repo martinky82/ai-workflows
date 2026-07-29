@@ -13,6 +13,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, RootModel
 
+from ymir.common.validators import UniqueSortedList
+
 
 class TriageEligibility(StrEnum):
     """Three-state triage eligibility."""
@@ -41,6 +43,10 @@ class CVEEligibilityResult(BaseModel):
     pending_zstream_issues: list[str] | None = Field(
         default=None,
         description="Jira issue keys of unshipped Z-stream clones; at least one must ship before triage",
+    )
+    duplicate_of: str | None = Field(
+        default=None,
+        description="Jira key of an older tracker for the same CVE, component, and fix version",
     )
 
     @property
@@ -118,6 +124,10 @@ class RebaseInputSchema(BaseModel):
     triage_summary: str | None = Field(
         default=None,
         description="Triage context: what was investigated and guidance on how the rebase should be done",
+    )
+    leading_zstream_branch: str | None = Field(
+        default=None,
+        description="Leading z-stream branch in the same dist-git repo, if one exists",
     )
 
 
@@ -228,6 +238,10 @@ class RebaseData(BaseModel):
         "Do NOT repeat the justification rationale here.",
     )
     jira_issue: str = Field(description="Jira issue identifier")
+    cve_id: str | None = Field(
+        description="CVE identifier(s); include ALL CVE IDs when the issue covers multiple CVEs",
+        default=None,
+    )
     fix_version: str | None = Field(description="Fix version in Jira (e.g., 'rhel-9.8')", default=None)
 
 
@@ -284,7 +298,10 @@ class RebuildData(BaseModel):
 
     package: str = Field(description="Package name")
     jira_issue: str = Field(description="Jira issue identifier")
-    cve_id: str | None = Field(description="CVE identifier", default=None)
+    cve_id: str | None = Field(
+        description="CVE identifier(s); include ALL CVE IDs when the issue covers multiple CVEs",
+        default=None,
+    )
     justification: str | None = Field(
         default=None,
         description="Reviewer-facing rationale: why a rebuild is needed and how it addresses the issue. "
@@ -305,6 +322,10 @@ class RebuildData(BaseModel):
         default=None,
     )
     fix_version: str | None = Field(description="Fix version in Jira (e.g., 'rhel-9.8')", default=None)
+    side_tag: str | None = Field(
+        description="Koji build side-tag name from the Jira issue, if specified (older z-streams only)",
+        default=None,
+    )
     consolidated_issues: list[ConsolidatedIssue] = Field(
         default_factory=list,
         description="Sibling issues consolidated into this rebuild task",
@@ -364,7 +385,10 @@ class PostponedData(BaseModel):
     fix_version: str | None = Field(
         default=None, description="Fix version in Jira (for rebuild postponements)"
     )
-    cve_id: str | None = Field(default=None, description="CVE identifier (for rebuild postponements)")
+    cve_id: str | None = Field(
+        description="CVE identifier(s); include ALL CVE IDs when the issue covers multiple CVEs",
+        default=None,
+    )
     dependency_issue: str | None = Field(
         default=None,
         description="Key of the dependency Jira issue that triggered the rebuild (for rebuild postponements)",
@@ -610,7 +634,7 @@ class BuildInputSchema(BaseModel):
 
     srpm_path: Path = Field(description="Path to SRPM to build")
     dist_git_branch: str = Field(description="dist-git branch to update")
-    jira_issue: str = Field(description="Jira issue to reference as resolved")
+    jira_issue: str | None = Field(description="Jira issue to reference as resolved")
 
 
 class BuildOutputSchema(BaseModel):
@@ -633,7 +657,7 @@ class BuildOutputSchema(BaseModel):
 class LogInputSchema(BaseModel):
     """Input schema for the log agent."""
 
-    jira_issue: str = Field(description="Jira issue to reference as resolved")
+    jira_issue: str | None = Field(description="Jira issue to reference as resolved")
     changes_summary: str = Field(description="Summary of performed changes")
     source_changelog: str | None = Field(
         default=None,
@@ -699,6 +723,96 @@ class CachedMRMetadata(BaseModel):
     details: str = Field(
         description="Operation-specific identifier "
         "(list of upstream patch URLs for backport, version for rebase)"
+    )
+
+
+# ============================================================================
+# MR Consolidation Schemas
+# ============================================================================
+
+
+class MergeConsolidationJob(BaseModel):
+    """A job in the MR consolidation queue.
+
+    Stored as a Redis hash field value under the
+    ``merge_consolidation_queue`` key.
+    """
+
+    package: str = Field(description="RPM package name")
+    target_branch: str = Field(description="Dist-git branch the MRs target")
+    active: bool = Field(default=False, description="Whether this job is currently being processed")
+    submitted_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="When this job was submitted",
+    )
+    source_issues: UniqueSortedList | None = Field(
+        default=None,
+        description="When set, consolidate only the MRs for these specific Jira issue keys "
+        "(label-triggered mode). When None, pick the two oldest open MRs (auto mode). "
+        "Always stored sorted for deterministic logging and span correlation.",
+    )
+    activated_at: datetime | None = Field(
+        default=None,
+        description="When this job was promoted from :pending to :active by pick_next_job. "
+        "Set by the caller immediately after Lua promotion; used by sweep_stale_active_jobs "
+        "to measure genuine active-time rather than total queue-time.",
+    )
+    release_strategy: str | None = Field(
+        default=None,
+        description="Release strategy override from package config ('merged' or 'per_commit'). "
+        "When None, the agent uses the RELEASE_STRATEGY environment variable or its default.",
+    )
+
+
+class ConsolidationReleaseStrategy(Enum):
+    """Controls how the package release number is handled during consolidation."""
+
+    MERGED = "merged"
+    PER_COMMIT = "per_commit"
+
+
+class PackageConsolidationConfig(BaseModel):
+    """Machine-readable consolidation config from the per-package rules repo.
+
+    Parsed from the ``consolidation`` section of
+    ``gitlab.com/redhat/centos-stream/rules/<package>/ymir.yaml``.
+    """
+
+    merge_mrs: bool = Field(
+        default=True,
+        description="Whether to consolidate multiple backport MRs into one",
+    )
+    release_strategy: ConsolidationReleaseStrategy = Field(
+        default=ConsolidationReleaseStrategy.PER_COMMIT,
+        description="How to handle release numbers: 'merged' for a single bump, "
+        "'per_commit' for one bump per original commit",
+    )
+
+
+class MRConsolidationInputSchema(BaseModel):
+    """Input schema for the MR consolidation agent."""
+
+    local_clone: Path = Field(description="Path to the local clone of forked dist-git repository")
+    package: str = Field(description="Package name")
+    dist_git_branch: str = Field(description="Target dist-git branch")
+    mr_branches: list[str] = Field(description="Source branches of the MRs being consolidated")
+    mr_descriptions: list[str] = Field(description="Descriptions of the MRs being consolidated")
+    mr_titles: list[str] = Field(description="Titles of the MRs being consolidated")
+    jira_issues: list[str] = Field(description="Jira issues resolved by the source MRs")
+    release_strategy: str = Field(description="Release strategy: 'merged' or 'per_commit'")
+    build_error: str | None = Field(default=None, description="Error encountered during package build")
+
+
+class MRConsolidationOutputSchema(BaseModel):
+    """Output schema for the MR consolidation agent."""
+
+    success: bool = Field(description="Whether the consolidation was successfully completed")
+    status: str = Field(description="Consolidation status with details of how the merge was performed")
+    srpm_path: Path | None = Field(default=None, description="Absolute path to generated SRPM")
+    error: str | None = Field(default=None, description="Specific details about an error")
+    files_to_git_add: list[str] | None = Field(
+        default=None,
+        description="List of files that should be git added and committed",
     )
 
 

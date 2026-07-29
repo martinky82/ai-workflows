@@ -10,11 +10,17 @@ from beeai_framework.workflows import Workflow
 from pydantic import Field
 
 import ymir.agents.tasks as tasks
-from ymir.agents.constants import I_AM_YMIR, mr_description_footer
+from ymir.agents.constants import (
+    I_AM_YMIR,
+    ZSTREAM_TARGET_LABEL,
+    format_jira_links_for_mr,
+    mr_description_footer,
+)
 from ymir.agents.log_agent import create_log_agent
 from ymir.agents.log_agent import get_prompt as get_log_prompt
 from ymir.agents.observability import setup_observability
 from ymir.agents.package_update_steps import PackageUpdateState
+from ymir.agents.tasks import InvalidConsolidationConfigError
 from ymir.agents.utils import (
     format_mr_triage_details,
     get_agent_execution_config,
@@ -24,7 +30,7 @@ from ymir.agents.utils import (
     resolve_chat_model_override,
     run_subprocess,
 )
-from ymir.common.base_utils import fix_await, redis_client, run_task_loop
+from ymir.common.base_utils import fix_await, install_shutdown_handler, redis_client, run_task_loop
 from ymir.common.constants import JiraLabels, RedisQueues
 from ymir.common.logging_setup import configure_logging, current_jira_issue
 from ymir.common.mock_repos import get_mock_local_tool_env
@@ -52,31 +58,35 @@ async def main() -> None:
 
     dry_run = os.getenv("DRY_RUN", "False").lower() == "true"
 
-    local_tool_options = {"working_directory": None}
-
     class State(PackageUpdateState):
         rebuild_success: bool = Field(default=False)
         rebuild_error: str | None = Field(default=None)
+        fix_version: str | None = Field(default=None)
         justification: str | None = Field(default=None)
         triage_summary: str | None = Field(default=None)
         dependency_issue: str | None = Field(default=None)
         dependency_component: str | None = Field(default=None)
         consolidated_issues: list[ConsolidatedIssue] = Field(default_factory=list)
         consolidation_summary: str | None = Field(default=None)
+        side_tag: str | None = Field(default=None)
 
     async def run_workflow(
         package,
         dist_git_branch,
         jira_issue,
+        fix_version=None,
         justification=None,
         triage_summary=None,
         dependency_issue=None,
         dependency_component=None,
         consolidated_issues=None,
         consolidation_summary=None,
+        side_tag=None,
         user_triggered=False,
+        redis_conn=None,
+        dist_git_namespace=None,
     ):
-        local_tool_options["working_directory"] = None
+        local_tool_options = {"working_directory": None}
         if mock_env := get_mock_local_tool_env(jira_issue):
             local_tool_options["env"] = mock_env
 
@@ -98,6 +108,7 @@ async def main() -> None:
                     package=state.package,
                     dist_git_branch=state.dist_git_branch,
                     available_tools=gateway_tools,
+                    dist_git_namespace=state.dist_git_namespace,
                 )
                 local_tool_options["working_directory"] = state.local_clone
                 return "update_release"
@@ -115,7 +126,7 @@ async def main() -> None:
                     state.rebuild_success = False
                     state.rebuild_error = f"Could not update release: {e}"
                     return "comment_in_jira"
-                return "run_log_agent"
+                return "stage_changes"
 
             def _all_dependency_components(state):
                 components = set()
@@ -176,7 +187,9 @@ async def main() -> None:
                     state.rebuild_success = False
                     state.rebuild_error = f"Could not stage changes: {e}"
                     return "comment_in_jira"
-                return "commit_push_and_open_mr"
+                if state.log_result:
+                    return "commit_push_and_open_mr"
+                return "run_log_agent"
 
             async def commit_push_and_open_mr(state):
                 try:
@@ -205,6 +218,9 @@ async def main() -> None:
 
                     all_issues = [state.jira_issue] + [ci.issue_key for ci in state.consolidated_issues]
                     resolves_text = "Resolves: " + ", ".join(all_issues)
+                    jira_links_text = format_jira_links_for_mr(all_issues)
+
+                    side_tag_text = f"\nside-tag: {state.side_tag}\n" if state.side_tag else ""
 
                     consolidation_text = ""
                     if state.consolidation_summary:
@@ -233,17 +249,26 @@ async def main() -> None:
                         mr_title=state.log_result.title,
                         mr_description=(
                             f"{state.log_result.description}\n\n"
-                            f"{triage_details_text}"
                             f"{dep_text}"
                             f"{dep_issues_text}"
-                            f"{resolves_text}\n"
+                            f"{jira_links_text}"
+                            f"{side_tag_text}\n"
+                            f"{triage_details_text}"
                             f"{consolidation_text}"
                             f"\n\n{mr_description_footer(state.package)}"
                         ),
                         available_tools=gateway_tools,
                         commit_only=dry_run,
                         allow_empty=is_empty_commit,
-                        labels=["ymir_rebuild"],
+                        labels=["ymir_rebuild"]
+                        + (
+                            [ZSTREAM_TARGET_LABEL]
+                            if await tasks.needs_zstream_target_label(
+                                state.dist_git_branch, state.fix_version
+                            )
+                            else []
+                        ),
+                        package=state.package,
                     )
                     state.rebuild_success = True
                 except Exception as e:
@@ -251,6 +276,28 @@ async def main() -> None:
                     state.merge_request_url = None
                     state.rebuild_success = False
                     state.rebuild_error = f"Could not commit and open MR: {e}"
+                return "submit_consolidation_job"
+
+            async def submit_consolidation_job(state):
+                if (
+                    not state.merge_request_url
+                    or not state.rebuild_success
+                    or not state.merge_request_newly_created
+                ):
+                    return "comment_in_jira"
+
+                try:
+                    await tasks.try_submit_consolidation_job(
+                        state.package,
+                        state.dist_git_branch,
+                        gateway_tools,
+                        redis_conn,
+                    )
+                except InvalidConsolidationConfigError as e:
+                    logger.warning("Invalid consolidation config for %s: %s", state.package, e)
+                except Exception as e:
+                    logger.warning("Failed to submit consolidation job: %s", e)
+
                 return "comment_in_jira"
 
             async def comment_in_jira(state):
@@ -285,22 +332,26 @@ async def main() -> None:
 
             workflow.add_step("fork_and_prepare_dist_git", fork_and_prepare_dist_git)
             workflow.add_step("update_release", update_release)
-            workflow.add_step("run_log_agent", run_log_agent)
             workflow.add_step("stage_changes", stage_changes)
+            workflow.add_step("run_log_agent", run_log_agent)
             workflow.add_step("commit_push_and_open_mr", commit_push_and_open_mr)
+            workflow.add_step("submit_consolidation_job", submit_consolidation_job)
             workflow.add_step("comment_in_jira", comment_in_jira)
 
             response = await workflow.run(
                 State(
                     package=package,
                     dist_git_branch=dist_git_branch,
+                    dist_git_namespace=dist_git_namespace,
                     jira_issue=jira_issue,
+                    fix_version=fix_version,
                     justification=justification,
                     triage_summary=triage_summary,
                     dependency_issue=dependency_issue,
                     dependency_component=dependency_component,
                     consolidated_issues=consolidated_issues or [],
                     consolidation_summary=consolidation_summary,
+                    side_tag=side_tag,
                 ),
             )
             return response.state
@@ -316,11 +367,12 @@ async def main() -> None:
         consolidated_raw = os.getenv("CONSOLIDATED_ISSUES", None)
         consolidated_issues = json.loads(consolidated_raw) if consolidated_raw else None
         logger.info("Running in direct mode with environment variables")
-        with span_processor.start_transaction(jira_issue, workflow="rebuild"):
+        with span_processor.start_transaction(jira_issue, workflow="RebuildWorkflow"):
             state = await run_workflow(
                 package=package,
                 dist_git_branch=branch,
                 jira_issue=jira_issue,
+                fix_version=os.getenv("FIX_VERSION"),
                 justification=os.getenv("JUSTIFICATION", None),
                 triage_summary=os.getenv("TRIAGE_SUMMARY", None),
                 dependency_issue=dependency_issue,
@@ -355,6 +407,7 @@ async def main() -> None:
                 rebuild_data = RebuildData.model_validate(triage_state["triage_result"]["data"])
                 current_jira_issue.set(rebuild_data.jira_issue)
                 dist_git_branch = triage_state["target_branch"]
+                dist_git_namespace = triage_state.get("dist_git_namespace")
                 user_triggered = task.user_triggered
             except Exception as e:
                 logger.error(f"Failed to parse task payload, skipping: {e}")
@@ -437,18 +490,22 @@ async def main() -> None:
                     await fix_await(redis.lpush(RedisQueues.ERROR_LIST.value, error))
 
             try:
-                with span_processor.start_transaction(rebuild_data.jira_issue, workflow="rebuild"):
+                with span_processor.start_transaction(rebuild_data.jira_issue, workflow="RebuildWorkflow"):
                     state = await run_workflow(
                         package=rebuild_data.package,
                         dist_git_branch=dist_git_branch,
                         jira_issue=rebuild_data.jira_issue,
+                        fix_version=rebuild_data.fix_version,
                         justification=rebuild_data.justification,
                         triage_summary=rebuild_data.triage_summary,
                         dependency_issue=rebuild_data.dependency_issue,
                         dependency_component=rebuild_data.dependency_component,
                         consolidated_issues=rebuild_data.consolidated_issues,
                         consolidation_summary=rebuild_data.consolidation_summary,
+                        side_tag=rebuild_data.side_tag,
                         user_triggered=user_triggered,
+                        redis_conn=redis,
+                        dist_git_namespace=dist_git_namespace,
                     )
                     logger.info(
                         f"Rebuild processing completed for {rebuild_data.jira_issue}, "
@@ -516,11 +573,14 @@ async def main() -> None:
                         ).model_dump_json(),
                     )
 
+        shutdown_event = asyncio.Event()
+        install_shutdown_handler(asyncio.get_running_loop(), shutdown_event)
         await run_task_loop(
             redis,
             [rebuild_queue_todo, rebuild_queue],
             process_task,
             max_concurrent=max_concurrent_tasks,
+            shutdown_event=shutdown_event,
         )
 
 

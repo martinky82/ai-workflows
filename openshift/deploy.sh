@@ -44,7 +44,14 @@ apply configmap-endpoints-env.yml
 apply configmap-jira-env.yml
 apply configmap-kerberos-env.yml
 
-# # Phoenix (observability)
+# Phoenix PostgreSQL database
+apply imagestream-phoenix-db.yml
+import_image phoenix-db
+apply pvc-phoenix-db-data.yml
+apply service-phoenix-db.yml
+apply deployment-phoenix-db.yml
+
+# Phoenix (observability)
 apply imagestream-phoenix.yml
 import_image phoenix
 apply pvc-phoenix-data.yml
@@ -92,6 +99,8 @@ apply deployment-rebase-agent-c9s.yml
 apply deployment-rebase-agent-c10s.yml
 apply deployment-rebuild-agent-c9s.yml
 apply deployment-rebuild-agent-c10s.yml
+apply deployment-mr-consolidation-agent-c9s.yml
+apply deployment-mr-consolidation-agent-c10s.yml
 
 # Jira Issue Fetcher
 apply imagestream-jira-issue-fetcher.yml
@@ -101,6 +110,11 @@ apply configmap-jira-issue-fetcher-filter-env.yml
 apply configmap-jira-issue-fetcher-todo-env.yml
 apply cronjob-jira-issue-fetcher.yml
 apply cronjob-jira-issue-fetcher-todo.yml
+
+# MR Cleanup
+apply imagestream-mr-cleanup.yml
+import_image mr-cleanup
+apply cronjob-mr-cleanup.yml
 
 # # Supervisor
 # apply imagestream-supervisor.yml

@@ -27,11 +27,16 @@ from specfile.utils import EVR
 from ymir.common.base_utils import is_cs_branch
 from ymir.common.constants import BREWHUB_URL, CENTOS_STREAM_KOJIHUB_URL
 from ymir.common.logging_setup import get_trajectory_writeable
-from ymir.common.version_utils import construct_internal_branch_name, parse_rhel_version
+from ymir.common.version_utils import (
+    construct_internal_branch_name,
+    get_maintenance_majors,
+    parse_rhel_version,
+)
 
 logger = logging.getLogger(__name__)
 
 FIXED_IN_BUILD_CUSTOM_FIELD = "customfield_10578"
+DOWNSTREAM_COMPONENT_CUSTOM_FIELD = "customfield_10669"  # Downstream Component Name
 
 
 class _MetaInjectingSession:
@@ -197,14 +202,12 @@ def _get_koji_build(koji_url: str, nvr: str) -> dict | None:
     return koji.ClientSession(koji_url).getBuild(nvr)
 
 
-async def get_latest_candidate_build(package: str, dist_git_branch: str) -> tuple[EVR, str]:
-    candidate_tags = [
-        f"{dist_git_branch}-candidate",
-        f"{dist_git_branch}-z-candidate",
-    ]
-
+async def _get_latest_build_from_tags(
+    package: str,
+    *tags: str,
+) -> tuple[EVR, str]:
     results = await asyncio.gather(
-        *(asyncio.to_thread(_get_latest_koji_build, BREWHUB_URL, tag, package) for tag in candidate_tags),
+        *(asyncio.to_thread(_get_latest_koji_build, BREWHUB_URL, tag, package) for tag in tags),
     )
     latest = None
     for build in results:
@@ -214,7 +217,7 @@ async def get_latest_candidate_build(package: str, dist_git_branch: str) -> tupl
         if latest is None or latest[0] < evr:
             latest = (evr, build["build_id"])
     if latest is None:
-        raise RuntimeError(f"There are no builds of {package} in {' or '.join(candidate_tags)}")
+        raise RuntimeError(f"There are no builds of {package} in {' or '.join(tags)}")
     evr, build_id = latest
     session = koji.ClientSession(BREWHUB_URL)
     metadata = await asyncio.to_thread(session.getBuild, build_id, strict=True)
@@ -222,23 +225,47 @@ async def get_latest_candidate_build(package: str, dist_git_branch: str) -> tupl
     return evr, source_ref
 
 
-def _resolve_buildroot_checks(target_branch: str, fix_version: str) -> list[tuple[str, str]]:
+async def get_latest_candidate_build(package: str, dist_git_branch: str) -> tuple[EVR, str]:
+    return await _get_latest_build_from_tags(
+        package,
+        f"{dist_git_branch}-candidate",
+        f"{dist_git_branch}-z-candidate",
+    )
+
+
+async def get_latest_z_pending_build(package: str, dist_git_branch: str) -> tuple[EVR, str]:
+    return await _get_latest_build_from_tags(
+        package,
+        f"{dist_git_branch}-z-pending",
+    )
+
+
+def _resolve_buildroot_checks(
+    target_branch: str, fix_version: str, rhel_config: dict | None = None
+) -> list[tuple[str, str]]:
     """Return a list of (koji_hub_url, build_tag) pairs to verify.
 
     For CS branches with a Z-stream fix_version, both the CS Koji
     buildroot and the Brew Z-stream buildroot are checked (CS-first
-    approach produces two builds).  For internal RHEL branches with
-    a Z-stream fix_version, only the Brew Z-stream buildroot is checked.
+    approach produces two builds).  CS branches in maintenance phase
+    (z-stream only, no y-stream) are an exception: only the Brew
+    Z-stream buildroot is checked since CentOS Stream Koji is stale.
+    For internal RHEL branches with a Z-stream fix_version, only the
+    Brew Z-stream buildroot is checked.
     """
     is_zstream = fix_version.lower().endswith(".z")
 
     if is_cs_branch(target_branch):
-        checks = [(CENTOS_STREAM_KOJIHUB_URL, f"{target_branch}-build")]
         if is_zstream and (parsed := parse_rhel_version(fix_version)):
             major, minor, _ = parsed
             rhel_branch = construct_internal_branch_name(major, minor)
-            checks.append((BREWHUB_URL, f"{rhel_branch}-z-build"))
-        return checks
+            if rhel_config and major in get_maintenance_majors(rhel_config):
+                return [(BREWHUB_URL, f"{rhel_branch}-z-build")]
+            return [
+                (CENTOS_STREAM_KOJIHUB_URL, f"{target_branch}-build"),
+                (BREWHUB_URL, f"{rhel_branch}-z-build"),
+            ]
+        return [(CENTOS_STREAM_KOJIHUB_URL, f"{target_branch}-build")]
 
     suffix = "-z-build" if is_zstream else "-build"
     return [(BREWHUB_URL, f"{target_branch}{suffix}")]
@@ -254,9 +281,13 @@ async def check_build_in_buildroot(
 
     Queries the appropriate Koji instance(s) based on ``target_branch`` and
     ``fix_version``.  For CS Z-stream fixes, both the CS Koji and Brew
-    Z-stream buildroots are checked.
+    Z-stream buildroots are checked (unless the major version is in
+    maintenance, in which case only Brew is checked).
     """
-    checks = _resolve_buildroot_checks(target_branch, fix_version)
+    from ymir.common.config import load_rhel_config
+
+    rhel_config = await load_rhel_config()
+    checks = _resolve_buildroot_checks(target_branch, fix_version, rhel_config)
 
     # Always resolve the fixed build's epoch from Brew — the NVR in
     # Jira's "Fixed in Build" is a Brew NVR (e.g. .el9_8) and may

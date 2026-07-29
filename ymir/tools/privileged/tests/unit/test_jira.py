@@ -14,11 +14,13 @@ from ymir.tools.privileged.jira import (
     ChangeJiraStatusTool,
     CheckCveTriageEligibilityTool,
     EditJiraLabelsTool,
+    FixApproach,
     GetJiraDetailsTool,
     SearchJiraIssuesTool,
     SetJiraFieldsTool,
     Severity,
     VerifyIssueAuthorTool,
+    _check_duplicate_tracker,
     _check_zstream_clones_shipped,
     extract_cve_id,
 )
@@ -553,6 +555,31 @@ async def test_check_zstream_clones_all_closed():
 
 
 @pytest.mark.asyncio
+async def test_check_zstream_clones_closed_done():
+    """Clone closed with resolution 'Done' (not 'Done-Errata') counts as shipped."""
+    search_result = [
+        {
+            "key": "RHEL-111",
+            "fields": {
+                "fixVersions": [{"name": "rhel-9.7.z"}],
+                "status": {"name": "Closed"},
+                "resolution": {"name": "Done"},
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+    flexmock(jira_tools).should_receive("load_rhel_config").and_return(
+        _create_async_return(RHEL_CONFIG)
+    ).once()
+
+    any_shipped, pending = await _check_zstream_clones_shipped("CVE-2025-12345", "curl", "RHEL-999")
+    assert any_shipped is True
+    assert pending == []
+
+
+@pytest.mark.asyncio
 async def test_check_zstream_clones_one_shipped_one_open():
     """At least one Z-stream clone shipped — proceed even if others are still open."""
     search_result = [
@@ -818,6 +845,9 @@ async def test_eligibility_ystream_any_clone_shipped():
     flexmock(jira_tools).should_receive("load_rhel_config").and_return(
         _create_async_return(RHEL_CONFIG)
     ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").and_return(
+        _create_async_return((None, False))
+    ).once()
     flexmock(jira_tools).should_receive("_check_zstream_clones_shipped").with_args(
         "CVE-2025-12345", "curl", "RHEL-12345"
     ).and_return(_create_async_return((True, []))).once()
@@ -840,6 +870,9 @@ async def test_eligibility_ystream_clones_pending():
     flexmock(jira_tools).should_receive("load_rhel_config").and_return(
         _create_async_return(RHEL_CONFIG)
     ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").and_return(
+        _create_async_return((None, False))
+    ).once()
     flexmock(jira_tools).should_receive("_check_zstream_clones_shipped").with_args(
         "CVE-2025-12345", "curl", "RHEL-12345"
     ).and_return(_create_async_return((False, ["RHEL-999"]))).once()
@@ -851,7 +884,8 @@ async def test_eligibility_ystream_clones_pending():
 
 @pytest.mark.parametrize("severity", ["Low", "Moderate"])
 @pytest.mark.asyncio
-async def test_eligibility_ystream_low_moderate_skipped(severity):
+async def test_eligibility_ystream_low_moderate_pending(severity):
+    """Low/Moderate Y-stream, no Z-stream clone has Fixed in Build yet — PENDING_DEPENDENCIES."""
     issue = _make_jira_issue(
         labels=["SecurityTracking"],
         fix_versions=[{"name": "rhel-9.8"}],
@@ -863,10 +897,75 @@ async def test_eligibility_ystream_low_moderate_skipped(severity):
     flexmock(jira_tools).should_receive("load_rhel_config").and_return(
         _create_async_return(RHEL_CONFIG)
     ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").and_return(
+        _create_async_return((None, False))
+    ).once()
+    flexmock(jira_tools).should_receive("_check_zstream_fix_approach").with_args(
+        "CVE-2025-12345", "curl", "RHEL-12345", "9"
+    ).and_return(_create_async_return((FixApproach.PENDING, ["RHEL-999"], ""))).once()
+
+    result = (await CheckCveTriageEligibilityTool().run(input={"issue_key": "RHEL-12345"})).result
+    assert result["eligibility"] == TriageEligibility.PENDING_DEPENDENCIES
+    assert result["pending_zstream_issues"] == ["RHEL-999"]
+    assert "waiting for RHEL-9 Z-stream clone Fixed in Build" in result["reason"]
+    assert "CentOS Stream first or RHEL first approach" in result["reason"]
+
+
+@pytest.mark.parametrize("severity", ["Low", "Moderate"])
+@pytest.mark.asyncio
+async def test_eligibility_ystream_low_moderate_cs_first(severity):
+    """Low/Moderate Y-stream, CS build found in Koji — NEVER (CentOS Stream first)."""
+    issue = _make_jira_issue(
+        labels=["SecurityTracking"],
+        fix_versions=[{"name": "rhel-9.8"}],
+        summary="CVE-2025-12345 buffer overflow in curl [rhel-9.8]",
+        severity=severity,
+        components=[{"name": "curl"}],
+    )
+    flexmock(aiohttp.ClientSession).should_receive("get").replace_with(_mock_jira_get(issue))
+    flexmock(jira_tools).should_receive("load_rhel_config").and_return(
+        _create_async_return(RHEL_CONFIG)
+    ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").and_return(
+        _create_async_return((None, False))
+    ).once()
+    flexmock(jira_tools).should_receive("_check_zstream_fix_approach").with_args(
+        "CVE-2025-12345", "curl", "RHEL-12345", "9"
+    ).and_return(
+        _create_async_return((FixApproach.CS_FIRST, [], "CS build curl-8.0-1.el9 found in CS Koji"))
+    ).once()
 
     result = (await CheckCveTriageEligibilityTool().run(input={"issue_key": "RHEL-12345"})).result
     assert result["eligibility"] == TriageEligibility.NEVER
-    assert "CentOS Stream path" in result["reason"]
+    assert "CentOS Stream first approach" in result["reason"]
+
+
+@pytest.mark.parametrize("severity", ["Low", "Moderate"])
+@pytest.mark.asyncio
+async def test_eligibility_ystream_low_moderate_rhel_first(severity):
+    """Low/Moderate Y-stream, no CS build found — IMMEDIATELY (RHEL first)."""
+    issue = _make_jira_issue(
+        labels=["SecurityTracking"],
+        fix_versions=[{"name": "rhel-9.8"}],
+        summary="CVE-2025-12345 buffer overflow in curl [rhel-9.8]",
+        severity=severity,
+        components=[{"name": "curl"}],
+    )
+    flexmock(aiohttp.ClientSession).should_receive("get").replace_with(_mock_jira_get(issue))
+    flexmock(jira_tools).should_receive("load_rhel_config").and_return(
+        _create_async_return(RHEL_CONFIG)
+    ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").and_return(
+        _create_async_return((None, False))
+    ).once()
+    flexmock(jira_tools).should_receive("_check_zstream_fix_approach").with_args(
+        "CVE-2025-12345", "curl", "RHEL-12345", "9"
+    ).and_return(_create_async_return((FixApproach.RHEL_FIRST, [], "no matching CS build in CS Koji"))).once()
+
+    result = (await CheckCveTriageEligibilityTool().run(input={"issue_key": "RHEL-12345"})).result
+    assert result["eligibility"] == TriageEligibility.IMMEDIATELY
+    assert result["needs_internal_fix"] is False
+    assert "RHEL first approach" in result["reason"]
 
 
 @pytest.mark.asyncio
@@ -956,8 +1055,327 @@ async def test_eligibility_maintenance_zstream_no_dependency_check():
     flexmock(jira_tools).should_receive("load_rhel_config").and_return(
         _create_async_return(RHEL_CONFIG)
     ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").and_return(
+        _create_async_return((None, False))
+    ).once()
     flexmock(jira_tools).should_receive("_check_zstream_clones_shipped").never()
 
     result = (await CheckCveTriageEligibilityTool().run(input={"issue_key": "RHEL-12345"})).result
     assert result["eligibility"] == TriageEligibility.IMMEDIATELY
     assert result["needs_internal_fix"] is True
+
+
+# --- Duplicate tracker check tests ---
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_no_duplicates():
+    """No other trackers found — no duplicate."""
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=[]))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key is None
+    assert should_block is False
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_active_older_tracker():
+    """Older tracker is open — should block the newer one."""
+    search_result = [
+        {
+            "key": "RHEL-100",
+            "fields": {
+                "status": {"name": "New"},
+                "resolution": None,
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key == "RHEL-100"
+    assert should_block is True
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_closed_rejected_older_tracker():
+    """Older tracker closed as WONTFIX — flag but don't block."""
+    search_result = [
+        {
+            "key": "RHEL-100",
+            "fields": {
+                "status": {"name": "Closed"},
+                "resolution": {"name": "WONTFIX"},
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key == "RHEL-100"
+    assert should_block is False
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_only_newer_trackers():
+    """Only newer trackers found — current issue is the original, no duplicate."""
+    search_result = [
+        {
+            "key": "RHEL-600",
+            "fields": {
+                "status": {"name": "New"},
+                "resolution": None,
+            },
+        },
+        {
+            "key": "RHEL-700",
+            "fields": {
+                "status": {"name": "In Progress"},
+                "resolution": None,
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key is None
+    assert should_block is False
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_mixed_older_active_and_rejected():
+    """One older tracker rejected, another older tracker active — should block."""
+    search_result = [
+        {
+            "key": "RHEL-100",
+            "fields": {
+                "status": {"name": "Closed"},
+                "resolution": {"name": "NOTABUG"},
+            },
+        },
+        {
+            "key": "RHEL-200",
+            "fields": {
+                "status": {"name": "In Progress"},
+                "resolution": None,
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key == "RHEL-200"
+    assert should_block is True
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_multiple_rejected_picks_oldest():
+    """Multiple rejected older trackers — returns the oldest one."""
+    search_result = [
+        {
+            "key": "RHEL-300",
+            "fields": {
+                "status": {"name": "Closed"},
+                "resolution": {"name": "DUPLICATE"},
+            },
+        },
+        {
+            "key": "RHEL-100",
+            "fields": {
+                "status": {"name": "Closed"},
+                "resolution": {"name": "WONTFIX"},
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key == "RHEL-100"
+    assert should_block is False
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_older_closed_done_errata_blocks():
+    """Older tracker closed as Done-Errata (shipped) is an active resolution — should block."""
+    search_result = [
+        {
+            "key": "RHEL-100",
+            "fields": {
+                "status": {"name": "Closed"},
+                "resolution": {"name": "Done-Errata"},
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key == "RHEL-100"
+    assert should_block is True
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_cross_project_ignored():
+    """Issues from a different project are not treated as duplicates."""
+    search_result = [
+        {
+            "key": "FOO-100",
+            "fields": {
+                "status": {"name": "New"},
+                "resolution": None,
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key is None
+    assert should_block is False
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_done_wontfix_not_blocked():
+    """Older tracker with status Done and resolution WONTFIX is rejected, not active."""
+    search_result = [
+        {
+            "key": "RHEL-100",
+            "fields": {
+                "status": {"name": "Done"},
+                "resolution": {"name": "WONTFIX"},
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key == "RHEL-100"
+    assert should_block is False
+
+
+@pytest.mark.asyncio
+async def test_check_duplicate_wont_do_not_blocked():
+    """Older tracker with Jira Cloud 'Won't Do' resolution is rejected, not active."""
+    search_result = [
+        {
+            "key": "RHEL-100",
+            "fields": {
+                "status": {"name": "Done"},
+                "resolution": {"name": "Won't Do"},
+            },
+        },
+    ]
+    flexmock(SearchJiraIssuesTool).should_receive("run").and_return(
+        _create_async_return(JSONToolOutput(result=search_result))
+    ).once()
+
+    dup_key, should_block = await _check_duplicate_tracker("CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-500")
+    assert dup_key == "RHEL-100"
+    assert should_block is False
+
+
+# --- Eligibility tool: duplicate tracker integration tests ---
+
+
+@pytest.mark.asyncio
+async def test_eligibility_zstream_blocking_duplicate():
+    """Z-stream CVE with an active duplicate — eligibility is NEVER with duplicate_of set."""
+    issue = _make_jira_issue(
+        labels=["SecurityTracking"],
+        fix_versions=[{"name": "rhel-9.6.z"}],
+        summary="CVE-2025-12345 buffer overflow in curl [rhel-9.6.z]",
+        severity="moderate",
+        components=[{"name": "curl"}],
+    )
+    flexmock(aiohttp.ClientSession).should_receive("get").replace_with(_mock_jira_get(issue))
+    flexmock(jira_tools).should_receive("load_rhel_config").and_return(
+        _create_async_return(
+            {
+                "current_y_streams": {"9": "rhel-9.8"},
+                "current_z_streams": {"9": "rhel-9.6.z"},
+                "upcoming_z_streams": {},
+            }
+        )
+    ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").with_args(
+        "CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-12345"
+    ).and_return(_create_async_return(("RHEL-100", True))).once()
+
+    result = (await CheckCveTriageEligibilityTool().run(input={"issue_key": "RHEL-12345"})).result
+    assert result["eligibility"] == TriageEligibility.NEVER
+    assert result["duplicate_of"] == "RHEL-100"
+    assert "duplicate" in result["reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_eligibility_zstream_nonblocking_duplicate():
+    """Z-stream CVE with a closed/rejected duplicate — eligible with duplicate_of set."""
+    issue = _make_jira_issue(
+        labels=["SecurityTracking"],
+        fix_versions=[{"name": "rhel-9.6.z"}],
+        summary="CVE-2025-12345 buffer overflow in curl [rhel-9.6.z]",
+        severity="moderate",
+        components=[{"name": "curl"}],
+    )
+    flexmock(aiohttp.ClientSession).should_receive("get").replace_with(_mock_jira_get(issue))
+    flexmock(jira_tools).should_receive("load_rhel_config").and_return(
+        _create_async_return(
+            {
+                "current_y_streams": {"9": "rhel-9.8"},
+                "current_z_streams": {"9": "rhel-9.6.z"},
+                "upcoming_z_streams": {},
+            }
+        )
+    ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").with_args(
+        "CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-12345"
+    ).and_return(_create_async_return(("RHEL-100", False))).once()
+
+    result = (await CheckCveTriageEligibilityTool().run(input={"issue_key": "RHEL-12345"})).result
+    assert result["eligibility"] == TriageEligibility.IMMEDIATELY
+    assert result["duplicate_of"] == "RHEL-100"
+
+
+@pytest.mark.asyncio
+async def test_eligibility_no_duplicate():
+    """Z-stream CVE with no duplicates — eligible without duplicate_of."""
+    issue = _make_jira_issue(
+        labels=["SecurityTracking"],
+        fix_versions=[{"name": "rhel-9.6.z"}],
+        summary="CVE-2025-12345 buffer overflow in curl [rhel-9.6.z]",
+        severity="moderate",
+        components=[{"name": "curl"}],
+    )
+    flexmock(aiohttp.ClientSession).should_receive("get").replace_with(_mock_jira_get(issue))
+    flexmock(jira_tools).should_receive("load_rhel_config").and_return(
+        _create_async_return(
+            {
+                "current_y_streams": {"9": "rhel-9.8"},
+                "current_z_streams": {"9": "rhel-9.6.z"},
+                "upcoming_z_streams": {},
+            }
+        )
+    ).once()
+    flexmock(jira_tools).should_receive("_check_duplicate_tracker").with_args(
+        "CVE-2025-12345", "curl", "rhel-9.6.z", "RHEL-12345"
+    ).and_return(_create_async_return((None, False))).once()
+
+    result = (await CheckCveTriageEligibilityTool().run(input={"issue_key": "RHEL-12345"})).result
+    assert result["eligibility"] == TriageEligibility.IMMEDIATELY
+    assert result["duplicate_of"] is None

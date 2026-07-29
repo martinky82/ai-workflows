@@ -1,6 +1,8 @@
 """Tools for working with upstream repositories and fix URLs."""
 
+import asyncio
 import re
+import shutil
 from urllib.parse import quote, urlparse
 
 import aiohttp
@@ -287,6 +289,10 @@ class CloneUpstreamRepositoryTool(Tool[CloneUpstreamRepositoryToolInput, ToolRun
     description = """
     Clone an upstream git repository to a specified directory.
 
+    Uses a blobless partial clone (--filter=blob:none): the full commit graph,
+    tags, and trees are fetched, but file contents are downloaded on demand.
+    All git operations (log, diff, cherry-pick, checkout) work normally.
+
     This is used to get a local copy of the upstream repository so we can:
     - Checkout a specific version/tag
     - Apply existing patches
@@ -319,11 +325,19 @@ class CloneUpstreamRepositoryTool(Tool[CloneUpstreamRepositoryToolInput, ToolRun
             # Create parent directory if needed
             clone_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Clone the repository
-            cmd = ["git", "clone", tool_input.repo_url, str(clone_path)]
-            exit_code, _, stderr = await run_subprocess(cmd)
+            # Clone the repository (blobless: full commit graph but deferred blobs)
+            cmd = ["git", "clone", "--filter=blob:none", tool_input.repo_url, str(clone_path)]
+            try:
+                exit_code, _, stderr = await asyncio.wait_for(run_subprocess(cmd), timeout=3600)
+            except TimeoutError:
+                shutil.rmtree(clone_path, ignore_errors=True)
+                raise ToolError("Clone timed out after 60 minutes") from None
+            except BaseException:
+                shutil.rmtree(clone_path, ignore_errors=True)
+                raise
 
             if exit_code != 0:
+                shutil.rmtree(clone_path, ignore_errors=True)
                 raise ToolError(f"Git clone failed: {stderr}")
 
             # Verify the clone was successful
@@ -361,10 +375,13 @@ class FindBaseCommitTool(Tool[FindBaseCommitToolInput, ToolRunOptions, StringToo
     Accepts three modes (highest priority first):
     - 'commit': checkout an exact commit hash (for repos without tags)
     - 'tag': checkout an exact tag name (when you know the right tag)
-    - pattern search: tries v{version}, {version}, release-{version}, etc.
+    - pattern search: tries common tag conventions including v{version},
+      {version}, release-{version}, V_{version}, REL_{version},
+      {pkgname}-{version} (with dots and underscores), and uppercase variants.
+      The package name is inferred from the repo path (-upstream suffix).
 
-    If pattern search fails, returns available tags so you can retry with
-    'tag' or 'commit'. Always stores the base commit for History/Trace tools.
+    If pattern search fails, returns a message (not an error) listing
+    version-relevant tags so you can retry with 'tag' or 'commit'.
     """
     input_schema = FindBaseCommitToolInput
 
@@ -404,6 +421,15 @@ class FindBaseCommitTool(Tool[FindBaseCommitToolInput, ToolRunOptions, StringToo
                 self.options["base_tag_commit"] = tool_input.commit
                 return StringToolOutput(result=f"Checked out commit {tool_input.commit} as base")
 
+            pkg_name = None
+            dir_name = tool_input.repo_path.name
+            if dir_name.endswith("-upstream"):
+                pkg_name = dir_name.removesuffix("-upstream")
+            # RHEL versioned packages (nodejs22, python39) → strip trailing digits
+            pkg_base = re.sub(r"[-_]?\d+$", "", pkg_name) if pkg_name else None
+            if pkg_base == pkg_name:
+                pkg_base = None
+
             if tool_input.tag:
                 cmd = ["git", "rev-parse", "--verify", f"refs/tags/{tool_input.tag}"]
                 exit_code, _, stderr = await run_subprocess(cmd, cwd=tool_input.repo_path)
@@ -411,17 +437,48 @@ class FindBaseCommitTool(Tool[FindBaseCommitToolInput, ToolRunOptions, StringToo
                     raise ToolError(f"Tag '{tool_input.tag}' not found in repository: {stderr}")
                 found_tag = tool_input.tag
             else:
-                # Common tag patterns to try
+                ver = tool_input.version
+                ver_under = ver.replace(".", "_")
+                # Split digit-letter boundaries then uppercase (e.g. 9.9p1 -> 9_9_P1)
+                ver_upper = re.sub(r"(\d)([a-zA-Z])", r"\1_\2", ver_under).upper()
+
                 tag_patterns = [
-                    f"v{tool_input.version}",
-                    f"{tool_input.version}",
-                    f"release-{tool_input.version}",
-                    f"{tool_input.version}-release",
-                    f"rel-{tool_input.version}",
-                    f"{tool_input.version}.0",
-                    f"v{tool_input.version}.0",
+                    f"v{ver}",
+                    f"{ver}",
+                    f"release-{ver}",
+                    f"{ver}-release",
+                    f"rel-{ver}",
+                    f"{ver}.0",
+                    f"v{ver}.0",
+                    f"v{ver_under}",
+                    f"V_{ver_upper}",
+                    f"REL_{ver_under}",
+                    f"REL{ver_under}",
                 ]
 
+                if pkg_name:
+                    tag_patterns.extend(
+                        [
+                            f"{pkg_name}-{ver_under}",
+                            f"{pkg_name}-{ver}",
+                            f"{pkg_name}_{ver_under}",
+                            f"{pkg_name.upper()}-{ver_under}",
+                            f"{pkg_name.upper()}_{ver_upper}",
+                        ]
+                    )
+
+                if pkg_base:
+                    tag_patterns.extend(
+                        [
+                            f"{pkg_base}-{ver_under}",
+                            f"{pkg_base}-{ver}",
+                            f"{pkg_base}_{ver_under}",
+                            f"{pkg_base.upper()}-{ver_under}",
+                            f"{pkg_base.upper()}_{ver_upper}",
+                        ]
+                    )
+
+                tag_patterns = list(dict.fromkeys(tag_patterns))
                 found_tag = None
                 for tag in tag_patterns:
                     cmd = ["git", "rev-parse", "--verify", f"refs/tags/{tag}"]
@@ -436,21 +493,33 @@ class FindBaseCommitTool(Tool[FindBaseCommitToolInput, ToolRunOptions, StringToo
                         cmd,
                         cwd=tool_input.repo_path,
                     )
-                    available_tags = stdout.strip().split("\n") if stdout.strip() else []
-                    tag_info = (
-                        f"Available tags: {', '.join(available_tags[:10])}"
-                        if available_tags
-                        else "No tags found in repository"
-                    )
-                    if len(available_tags) > 10:
-                        tag_info += f" (and {len(available_tags) - 10} more)"
+                    all_tags = stdout.strip().split("\n") if stdout.strip() else []
 
-                    raise ToolError(
-                        f"Could not find tag matching version {tool_input.version}. "
-                        f"Tried patterns: {', '.join(tag_patterns)}. "
-                        f"{tag_info}. "
-                        "Retry with 'tag' set to the exact tag name, "
-                        "or 'commit' set to the release commit hash."
+                    relevant = [t for t in all_tags if ver_under in t or ver in t or ver_upper in t]
+                    relevant_set = set(relevant)
+                    other = [t for t in all_tags if t not in relevant_set]
+
+                    if relevant:
+                        tag_info = f"Tags matching version components: {', '.join(relevant[:15])}"
+                        if other:
+                            tag_info += f". Other tags (sample): {', '.join(other[:5])}"
+                            if len(other) > 5:
+                                tag_info += f" (and {len(other) - 5} more)"
+                    elif all_tags:
+                        tag_info = f"Available tags: {', '.join(all_tags[:15])}"
+                        if len(all_tags) > 15:
+                            tag_info += f" (and {len(all_tags) - 15} more)"
+                    else:
+                        tag_info = "No tags found in repository"
+
+                    return StringToolOutput(
+                        result=(
+                            f"Could not find tag matching version {ver}. "
+                            f"Tried patterns: {', '.join(tag_patterns)}. "
+                            f"{tag_info}. "
+                            "Retry with 'tag' set to the exact tag name, "
+                            "or 'commit' set to the release commit hash."
+                        )
                     )
 
             # Checkout the found tag

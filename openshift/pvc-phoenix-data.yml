@@ -12,6 +12,6 @@ spec:
   - ReadWriteOnce
   resources:
     requests:
-      storage: 150Gi
+      storage: 2Gi
   storageClassName: netapp-nfs
   volumeMode: Filesystem

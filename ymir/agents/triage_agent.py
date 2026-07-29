@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sys
 import traceback
 from pathlib import Path
+from typing import Literal
 
 import sentry_sdk
 from beeai_framework.agents.requirement.requirements.conditional import (
@@ -34,7 +36,7 @@ from ymir.agents.utils import (
     resolve_chat_model_override,
     run_tool,
 )
-from ymir.common.base_utils import fix_await, redis_client, run_task_loop
+from ymir.common.base_utils import fix_await, install_shutdown_handler, redis_client, run_task_loop
 from ymir.common.config import load_rhel_config
 from ymir.common.constants import JiraLabels, RedisQueues
 from ymir.common.logging_setup import configure_logging, current_jira_issue, get_trajectory_writeable
@@ -44,6 +46,7 @@ from ymir.common.models import (
     ClarificationNeededData,
     CVEEligibilityResult,
     ErrorData,
+    IssueStatus,
     NotAffectedData,
     OpenEndedAnalysisData,
     PostponedData,
@@ -58,6 +61,7 @@ from ymir.common.models import (
     TriageOutputSchema as OutputSchema,
 )
 from ymir.common.utils import (
+    DOWNSTREAM_COMPONENT_CUSTOM_FIELD,
     FIXED_IN_BUILD_CUSTOM_FIELD,
     check_build_in_buildroot,
     get_latest_candidate_build,
@@ -68,6 +72,7 @@ from ymir.common.version_utils import (
     normalize_fix_version,
     parse_rhel_version,
 )
+from ymir.tools.privileged.utils import APPLICABILITY_DIR
 from ymir.tools.unprivileged.commands import RunShellCommandTool
 
 ## UpstreamSearchTool is currently unmaintained and disabled.
@@ -111,24 +116,120 @@ _RESOLUTION_TO_LABEL: dict[Resolution, JiraLabels] = {
 }
 
 
-async def determine_target_branch(
-    cve_eligibility_result: CVEEligibilityResult | None, triage_data: BaseModel
-) -> str | None:
+# Optional CVE-YYYY-NNNNN prefix, then module:stream/<package>:
+# The package segment is the Downstream Component Name (not a free word match).
+_MODULAR_SUMMARY_PREFIX = r"^(?:CVE-\d{4}-\d+\s+)?([\w.+-]+):([^/\s]+)/"
+
+
+def _modular_summary_re(downstream_component: str) -> re.Pattern[str]:
+    """Build a modular-summary regex anchored on the Downstream Component Name."""
+    return re.compile(_MODULAR_SUMMARY_PREFIX + re.escape(downstream_component) + r":")
+
+
+def _is_modular(jira_summary: str | None, downstream_component: str | None) -> bool:
+    """Detect whether the Jira ticket targets a modular package.
+
+    Modular summaries follow ``module:stream/<package>:Title`` (optionally
+    CVE-prefixed), where ``<package>`` is the Downstream Component Name
+    (customfield_10669), e.g. summary ``postgresql:12/postgresql:…`` with
+    downstream component ``postgresql``. Non-modular summaries are
+    ``package:Title`` or ``CVE-... package:Title``.
     """
-    Determine target branch from fix_version and CVE eligibility.
+    if not jira_summary or not downstream_component:
+        return False
+    return bool(_modular_summary_re(downstream_component).match(jira_summary))
+
+
+def _parse_module_summary(summary: str, downstream_component: str) -> tuple[str, str] | None:
+    """Extract module name and stream from a modular Jira summary.
+
+    Requires the component segment to match *downstream_component*.
+    E.g. summary ``postgresql:12/postgresql:…`` + package ``postgresql``
+    → ``("postgresql", "12")``.
+    """
+    m = _modular_summary_re(downstream_component).match(summary)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _map_version_to_module_branch(version: str, summary: str, downstream_component: str) -> str | None:
+    """Map version string to a modular target branch.
+
+    Branch format: ``stream-{module}-{stream}-rhel-{major}.{minor}.0``
+    E.g. version ``rhel-9.8`` + summary ``postgresql:12/postgresql:…``
+    + package ``postgresql`` → ``stream-postgresql-12-rhel-9.8.0``
+
+    The same branch name exists under both ``redhat/rhel/rpms`` and
+    ``redhat/centos-stream/rpms``; callers must also resolve the GitLab
+    namespace (see ``determine_target_branch``).
+    """
+    parsed_version = parse_rhel_version(version)
+    if not parsed_version:
+        logger.warning(f"Failed to parse version for modular branch: {version}")
+        return None
+
+    parsed_module = _parse_module_summary(summary, downstream_component)
+    if not parsed_module:
+        logger.warning(
+            f"Failed to parse module/stream from summary={summary!r} "
+            f"with downstream_component={downstream_component!r}"
+        )
+        return None
+
+    major, minor, _ = parsed_version
+    module, stream = parsed_module
+    branch = f"stream-{module}-{stream}-rhel-{major}.{minor}.0"
+    logger.info(f"Mapped {version} -> {branch} (modular)")
+    return branch
+
+
+async def determine_target_branch(
+    cve_eligibility_result: CVEEligibilityResult | None,
+    triage_data: BaseModel,
+    jira_summary: str | None = None,
+    downstream_component: str | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Determine target branch and optional GitLab namespace from fix_version
+    and CVE eligibility.
+
+    Returns:
+        ``(branch, dist_git_namespace)``. *dist_git_namespace* is set for
+        modular packages (``"rhel"`` or ``"centos-stream"``) where the branch
+        name alone cannot select the forge project; otherwise ``None`` and
+        callers fall back to ``is_cs_branch`` heuristics.
     """
     if not (hasattr(triage_data, "fix_version") and triage_data.fix_version):
         logger.warning("No fix_version available for branch mapping")
-        return None
+        return None, None
 
     # Check if CVE needs internal fix first
-    cve_needs_internal_fix = (
+    cve_needs_internal_fix = bool(
         cve_eligibility_result and cve_eligibility_result.is_cve and cve_eligibility_result.needs_internal_fix
     )
 
     package = triage_data.package if hasattr(triage_data, "package") else None
 
-    return await _map_version_to_branch(triage_data.fix_version, cve_needs_internal_fix, package)
+    if _is_modular(jira_summary, downstream_component):
+        branch = _map_version_to_module_branch(triage_data.fix_version, jira_summary, downstream_component)
+        if not branch:
+            return None, None
+
+        older_zstream = await is_older_zstream(triage_data.fix_version)
+        namespace: Literal["rhel", "centos-stream"] = (
+            "rhel" if cve_needs_internal_fix or older_zstream else "centos-stream"
+        )
+        jira_issue = getattr(triage_data, "jira_issue", "unknown")
+        logger.info(
+            f"Modular package detected for {jira_issue} "
+            f"(summary={jira_summary!r}, downstream_component={downstream_component!r}) -> "
+            f"branch={branch}, namespace={namespace}"
+        )
+        return branch, namespace
+
+    branch = await _map_version_to_branch(triage_data.fix_version, cve_needs_internal_fix, package)
+    return branch, None
 
 
 async def _map_version_to_branch(
@@ -212,19 +313,28 @@ async def render_prompt(
     input: InputSchema,
     fix_version: str | None = None,
     cve_eligibility_result: CVEEligibilityResult | None = None,
+    jira_summary: str | None = None,
+    downstream_component: str | None = None,
 ) -> str:
     older_zstream = bool(fix_version and await is_older_zstream(fix_version))
 
     updates: dict = {"is_older_zstream": older_zstream}
 
-    cve_needs_internal_fix = (
+    cve_needs_internal_fix = bool(
         cve_eligibility_result and cve_eligibility_result.is_cve and cve_eligibility_result.needs_internal_fix
     )
     if cve_needs_internal_fix and fix_version:
-        internal_branch = await _map_version_to_branch(fix_version, cve_needs_internal_fix=True)
-        if internal_branch and not internal_branch.startswith("c"):
-            updates["needs_internal_fix"] = True
-            updates["internal_target_branch"] = internal_branch
+        if _is_modular(jira_summary, downstream_component):
+            internal_branch = _map_version_to_module_branch(fix_version, jira_summary, downstream_component)
+            if internal_branch:
+                updates["needs_internal_fix"] = True
+                updates["internal_target_branch"] = internal_branch
+        else:
+            internal_branch = await _map_version_to_branch(fix_version, cve_needs_internal_fix=True)
+            # Skip CS fallbacks (c8s/c9s/…) — those are not internal RHEL branches.
+            if internal_branch and not internal_branch.startswith("c"):
+                updates["needs_internal_fix"] = True
+                updates["internal_target_branch"] = internal_branch
 
     input_with_flag = input.model_copy(update=updates)
     return render_template("triage/prompt.j2", input_with_flag)
@@ -235,6 +345,21 @@ class TriageState(BaseModel):
     cve_eligibility_result: CVEEligibilityResult | None = Field(default=None)
     triage_result: OutputSchema | None = Field(default=None)
     target_branch: str | None = Field(default=None)
+    dist_git_namespace: Literal["rhel", "centos-stream"] | None = Field(
+        default=None,
+        description=(
+            "Explicit GitLab rpms namespace when the target branch name is ambiguous "
+            "(modular stream-* branches exist under both rhel and centos-stream)."
+        ),
+    )
+    downstream_component: str | None = Field(
+        default=None,
+        description="Jira Downstream Component Name (customfield_10669), used for modular detection.",
+    )
+    jira_summary: str | None = Field(
+        default=None,
+        description="Jira issue summary (title), used for modular detection.",
+    )
     applicability_local_clone: Path | None = Field(default=None)
     applicability_unpacked_sources: Path | None = Field(default=None)
     applicability_used_fallback: bool = Field(default=False)
@@ -303,6 +428,11 @@ def create_triage_agent(gateway_tools, local_tool_options=None) -> ReasoningAgen
             "Never use shallow clones (--depth) when cloning upstream repositories. "
             "Shallow clones hide merge-request branches and make follow-up commits "
             "invisible to git log searches.",
+            "There is a firewall in place that may block some outgoing network requests "
+            "(e.g. curl, wget, git clone to external hosts). If a shell command fails "
+            "due to a blocked connection and the data it would provide is essential "
+            "for your task, stop and report an error. Never guess or fabricate "
+            "content that you were unable to retrieve.",
         ],
     )
 
@@ -343,7 +473,28 @@ async def run_workflow(
                 f"pending_zstream_issues={state.cve_eligibility_result.pending_zstream_issues}"
             )
 
+            dup_key = state.cve_eligibility_result.duplicate_of
+
             if eligibility == TriageEligibility.IMMEDIATELY:
+                if dup_key and not dry_run:
+                    logger.info(
+                        f"Issue {state.jira_issue} has a closed/rejected duplicate "
+                        f"{dup_key} — posting informational comment and proceeding"
+                    )
+                    try:
+                        await tasks.comment_in_jira(
+                            jira_issue=state.jira_issue,
+                            agent_type="Triage",
+                            comment_text=(
+                                f"An older tracker {dup_key} exists for the same CVE, "
+                                f"component, and fix version, but it was closed/rejected. "
+                                f"Proceeding with triage for this tracker."
+                            ),
+                            available_tools=gateway_tools,
+                            user_triggered=user_triggered,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to post duplicate info comment: {e}")
                 return "run_triage_analysis"
 
             if force_cve_triage and not state.cve_eligibility_result.error:
@@ -387,6 +538,18 @@ async def run_workflow(
                         jira_issue=state.jira_issue,
                     ),
                 )
+            elif dup_key:
+                state.triage_result = OutputSchema(
+                    resolution=Resolution.OPEN_ENDED_ANALYSIS,
+                    data=OpenEndedAnalysisData(
+                        summary=(
+                            f"Duplicate tracker detected. {state.jira_issue} appears to be "
+                            f"a duplicate of {dup_key} (same CVE, component, and fix version)."
+                        ),
+                        recommendation=(f"Consider closing this issue as a duplicate of {dup_key}."),
+                        jira_issue=state.jira_issue,
+                    ),
+                )
             else:
                 state.triage_result = OutputSchema(
                     resolution=Resolution.OPEN_ENDED_ANALYSIS,
@@ -403,8 +566,9 @@ async def run_workflow(
             """Run the main triage analysis"""
             logger.info(f"Running triage analysis for {state.jira_issue}")
 
-            # Pre-fetch JIRA fix version to determine z-stream prompt variant
+            # Pre-fetch JIRA details for z-stream prompt variant and summary propagation
             fix_version_name = None
+            jira_details = {}
             try:
                 jira_details = await run_tool(
                     "get_jira_details",
@@ -415,14 +579,18 @@ async def run_workflow(
                 if fix_versions:
                     fix_version_name = fix_versions[0].get("name", "")
             except Exception as e:
-                logger.warning(f"Failed to pre-fetch fix version for prompt selection: {e}")
+                logger.warning(f"Failed to pre-fetch Jira details for prompt selection: {e}")
 
             input_data = InputSchema(issue=state.jira_issue)
+            state.jira_summary = jira_details.get("fields", {}).get("summary")
+            state.downstream_component = jira_details.get("fields", {}).get(DOWNSTREAM_COMPONENT_CUSTOM_FIELD)
             response = await triage_agent.run(
                 await render_prompt(
                     input_data,
                     fix_version=fix_version_name,
                     cve_eligibility_result=state.cve_eligibility_result,
+                    jira_summary=state.jira_summary,
+                    downstream_component=state.downstream_component,
                 ),
                 expected_output=render_template("triage/output_format.j2"),
                 **get_agent_execution_config(),
@@ -438,7 +606,6 @@ async def run_workflow(
                 state.triage_result.data.fix_version = normalize_fix_version(
                     state.triage_result.data.fix_version, rhel_config
                 )
-
             if state.triage_result.resolution == Resolution.REBASE:
                 return "verify_rebase_author"
             if state.triage_result.resolution in [
@@ -469,13 +636,18 @@ async def run_workflow(
             """Determine target branch for rebase/backport decisions"""
             logger.info(f"Determining target branch for {state.jira_issue}")
 
-            state.target_branch = await determine_target_branch(
+            state.target_branch, state.dist_git_namespace = await determine_target_branch(
                 cve_eligibility_result=state.cve_eligibility_result,
                 triage_data=state.triage_result.data,
+                jira_summary=state.jira_summary,
+                downstream_component=state.downstream_component,
             )
 
             if state.target_branch:
-                logger.info(f"Target branch determined: {state.target_branch}")
+                logger.info(
+                    f"Target branch determined: {state.target_branch}"
+                    + (f" (namespace={state.dist_git_namespace})" if state.dist_git_namespace else "")
+                )
             else:
                 logger.warning(f"Could not determine target branch for {state.jira_issue}")
 
@@ -601,6 +773,7 @@ async def run_workflow(
                     available_tools=gateway_tools,
                     jira_issue=state.jira_issue,
                     ref=base_ref,
+                    dist_git_namespace=state.dist_git_namespace,
                 )
             except Exception as e:
                 logger.warning(f"Could not prep sources for applicability check: {e}")
@@ -768,7 +941,7 @@ async def run_workflow(
             return "comment_in_jira"
 
         async def comment_in_jira(state):
-            applicability_dir = Path(os.environ["GIT_REPO_BASEPATH"]) / "applicability" / state.jira_issue
+            applicability_dir = Path(os.environ["GIT_REPO_BASEPATH"]) / APPLICABILITY_DIR / state.jira_issue
             if applicability_dir.exists():
                 shutil.rmtree(applicability_dir, ignore_errors=True)
                 state.applicability_local_clone = None
@@ -824,7 +997,7 @@ async def main() -> None:
 
     if jira_issue := os.getenv("JIRA_ISSUE", None):
         logger.info("Running in direct mode with environment variable")
-        with span_processor.start_transaction(jira_issue, workflow="triage"):
+        with span_processor.start_transaction(jira_issue, workflow="TriageWorkflow"):
             agent_factory = build_agent_factory_with_mock_repos(create_triage_agent, jira_issue)
             state = await run_workflow(
                 jira_issue,
@@ -869,7 +1042,7 @@ async def main() -> None:
             # retries do not re-post the ack after it has already been
             # delivered.
 
-            current_labels = await tasks.get_jira_labels(input.issue)
+            current_labels, current_status = await tasks.get_jira_issue_metadata(input.issue)
             all_labels = JiraLabels.all_labels()
             terminal_ymir_labels = [
                 label
@@ -886,6 +1059,25 @@ async def main() -> None:
                     f"Skipping duplicate triage for {input.issue} — "
                     f"already has labels: {terminal_ymir_labels}"
                 )
+                return
+
+            if current_status in (IssueStatus.CLOSED.value, IssueStatus.DONE.value):
+                logger.info(f"Skipping triage for {input.issue} — issue is already {current_status}")
+                if user_triggered:
+                    await tasks.set_jira_labels(
+                        jira_issue=input.issue,
+                        labels_to_remove=["ymir_todo"],
+                        dry_run=dry_run,
+                        user_triggered=True,
+                    )
+                    await tasks.post_user_ack_once(
+                        task,
+                        input.issue,
+                        "triage",
+                        f"Issue is already **{current_status}** — skipping processing.",
+                        user_triggered=True,
+                        dry_run=dry_run,
+                    )
                 return
 
             async def retry(task, error, input=input, user_triggered=user_triggered):
@@ -982,7 +1174,7 @@ async def main() -> None:
 
             try:
                 logger.info(f"Starting triage processing for {input.issue}")
-                with span_processor.start_transaction(input.issue, workflow="triage"):
+                with span_processor.start_transaction(input.issue, workflow="TriageWorkflow"):
                     state = await run_workflow(
                         input.issue,
                         dry_run,
@@ -1064,6 +1256,15 @@ async def main() -> None:
                         if output.resolution == Resolution.OPEN_ENDED_ANALYSIS:
                             queue = RedisQueues.OPEN_ENDED_ANALYSIS_LIST.value
                             downstream_payload = output.data.model_dump_json()
+                        elif output.resolution == Resolution.CLARIFICATION_NEEDED:
+                            # Clarification does not require a target branch.
+                            task = Task(metadata=state.model_dump(), user_triggered=user_triggered)
+                            queue = RedisQueues.CLARIFICATION_NEEDED_QUEUE.value
+                            downstream_payload = task.model_dump_json()
+                        elif not state.target_branch:
+                            # Unmapped tickets return None; skip branch-based queues.
+                            logger.info(f"No target branch for {input.issue} — skipping downstream dispatch")
+                            queue = None
                         else:
                             task = Task(metadata=state.model_dump(), user_triggered=user_triggered)
                             downstream_payload = task.model_dump_json()
@@ -1075,22 +1276,24 @@ async def main() -> None:
                                 queue = RedisQueues.get_backport_queue_for_branch(
                                     state.target_branch, task.user_triggered
                                 )
-                            elif output.resolution == Resolution.REBUILD:
+                            else:
                                 queue = RedisQueues.get_rebuild_queue_for_branch(
                                     state.target_branch, task.user_triggered
                                 )
-                            else:
-                                queue = RedisQueues.CLARIFICATION_NEEDED_QUEUE.value
-                        await fix_await(redis.lpush(queue, downstream_payload))
-                        logger.info(f"Pushed {input.issue} to {queue}")
+                        if queue is not None:
+                            await fix_await(redis.lpush(queue, downstream_payload))
+                            logger.info(f"Pushed {input.issue} to {queue}")
                     else:
                         logger.info(f"AUTO_CHAIN disabled, skipping downstream queue for {input.issue}")
 
+        shutdown_event = asyncio.Event()
+        install_shutdown_handler(asyncio.get_running_loop(), shutdown_event)
         await run_task_loop(
             redis,
             [RedisQueues.TRIAGE_QUEUE_TODO.value, RedisQueues.TRIAGE_QUEUE.value],
             process_task,
             max_concurrent=max_concurrent_tasks,
+            shutdown_event=shutdown_event,
         )
 
 

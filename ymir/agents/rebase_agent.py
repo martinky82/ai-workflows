@@ -21,7 +21,12 @@ from pydantic import Field
 import ymir.agents.tasks as tasks
 from ymir.agents.build_agent import create_build_agent
 from ymir.agents.build_agent import get_prompt as get_build_prompt
-from ymir.agents.constants import I_AM_YMIR, mr_description_footer
+from ymir.agents.constants import (
+    I_AM_YMIR,
+    ZSTREAM_TARGET_LABEL,
+    format_jira_links_for_mr,
+    mr_description_footer,
+)
 from ymir.agents.log_agent import create_log_agent
 from ymir.agents.log_agent import get_prompt as get_log_prompt
 from ymir.agents.observability import setup_observability
@@ -39,7 +44,7 @@ from ymir.agents.utils import (
     resolve_chat_model_override,
     wrap_details,
 )
-from ymir.common.base_utils import fix_await, redis_client, run_task_loop
+from ymir.common.base_utils import fix_await, install_shutdown_handler, redis_client, run_task_loop
 from ymir.common.constants import JiraLabels, RedisQueues
 from ymir.common.logging_setup import configure_logging, current_jira_issue, get_trajectory_writeable
 from ymir.common.mock_repos import get_mock_local_tool_env
@@ -127,13 +132,13 @@ async def main() -> None:
     dry_run = os.getenv("DRY_RUN", "False").lower() == "true"
     max_build_attempts = int(os.getenv("MAX_BUILD_ATTEMPTS", "10"))
 
-    local_tool_options: dict[str, Any] = {"working_directory": None}
-
     class State(PackageUpdateState):
         version: str
+        fix_version: str | None = Field(default=None)
         justification: str | None = Field(default=None)
         triage_summary: str | None = Field(default=None)
         fedora_clone: Path | None = Field(default=None)
+        leading_zstream_branch: str | None = Field(default=None)
         rebase_log: list[str] = Field(default_factory=list)
         rebase_result: RebaseOutputSchema | None = Field(default=None)
         attempts_remaining: int = Field(default=max_build_attempts)
@@ -145,12 +150,14 @@ async def main() -> None:
         dist_git_branch,
         version,
         jira_issue,
+        fix_version=None,
         justification=None,
         triage_summary=None,
         redis_conn=None,
         user_triggered=False,
+        dist_git_namespace=None,
     ):
-        local_tool_options["working_directory"] = None
+        local_tool_options: dict[str, Any] = {"working_directory": None}
         if mock_env := get_mock_local_tool_env(jira_issue):
             local_tool_options["env"] = mock_env
 
@@ -190,8 +197,10 @@ async def main() -> None:
                     dist_git_branch=state.dist_git_branch,
                     available_tools=gateway_tools,
                     with_fedora=True,
+                    dist_git_namespace=state.dist_git_namespace,
                 )
                 local_tool_options["working_directory"] = state.local_clone
+                state.leading_zstream_branch = await tasks.find_leading_zstream_branch(state.dist_git_branch)
                 return "run_rebase_agent"
 
             async def run_rebase_agent(state):
@@ -207,6 +216,7 @@ async def main() -> None:
                             jira_issue=state.jira_issue,
                             build_error=state.build_error,
                             triage_summary=state.triage_summary,
+                            leading_zstream_branch=state.leading_zstream_branch,
                         ),
                     ),
                     expected_output=RebaseOutputSchema,
@@ -344,13 +354,21 @@ async def main() -> None:
                         mr_description=(
                             f"{state.log_result.description}\n\n"
                             f"{triage_details_text}"
-                            f"Resolves: {state.jira_issue}\n\n"
+                            f"{format_jira_links_for_mr(state.jira_issue)}\n"
                             f"{wrap_details('Rebase status', state.rebase_log[-1])}"
                             f"\n\n{mr_description_footer(state.package)}"
                         ),
                         available_tools=gateway_tools,
                         commit_only=dry_run,
-                        labels=["ymir_rebase"],
+                        labels=["ymir_rebase"]
+                        + (
+                            [ZSTREAM_TARGET_LABEL]
+                            if await tasks.needs_zstream_target_label(
+                                state.dist_git_branch, state.fix_version
+                            )
+                            else []
+                        ),
+                        package=state.package,
                     )
                 except Exception as e:
                     logger.warning(f"Error committing and opening MR: {e}")
@@ -394,8 +412,10 @@ async def main() -> None:
                 State(
                     package=package,
                     dist_git_branch=dist_git_branch,
+                    dist_git_namespace=dist_git_namespace,
                     version=version,
                     jira_issue=jira_issue,
+                    fix_version=fix_version,
                     justification=justification,
                     triage_summary=triage_summary,
                 ),
@@ -409,12 +429,13 @@ async def main() -> None:
         and (branch := os.getenv("BRANCH", None))
     ):
         logger.info("Running in direct mode with environment variables")
-        with span_processor.start_transaction(jira_issue, workflow="rebase"):
+        with span_processor.start_transaction(jira_issue, workflow="RebaseWorkflow"):
             state = await run_workflow(
                 package=package,
                 dist_git_branch=branch,
                 version=version,
                 jira_issue=jira_issue,
+                fix_version=os.getenv("FIX_VERSION"),
                 justification=os.getenv("JUSTIFICATION", None),
                 triage_summary=os.getenv("TRIAGE_SUMMARY", None),
                 redis_conn=None,
@@ -446,6 +467,7 @@ async def main() -> None:
             rebase_data = RebaseData.model_validate(triage_state["triage_result"]["data"])
             current_jira_issue.set(rebase_data.jira_issue)
             dist_git_branch = triage_state["target_branch"]
+            dist_git_namespace = triage_state.get("dist_git_namespace")
             user_triggered = task.user_triggered
             logger.info(
                 f"Processing rebase for package: {rebase_data.package}, "
@@ -506,16 +528,18 @@ async def main() -> None:
 
             try:
                 logger.info(f"Starting rebase processing for {rebase_data.jira_issue}")
-                with span_processor.start_transaction(rebase_data.jira_issue, workflow="rebase"):
+                with span_processor.start_transaction(rebase_data.jira_issue, workflow="RebaseWorkflow"):
                     state = await run_workflow(
                         package=rebase_data.package,
                         dist_git_branch=dist_git_branch,
                         version=rebase_data.version,
                         jira_issue=rebase_data.jira_issue,
+                        fix_version=rebase_data.fix_version,
                         justification=rebase_data.justification,
                         triage_summary=rebase_data.triage_summary,
                         redis_conn=redis,
                         user_triggered=user_triggered,
+                        dist_git_namespace=dist_git_namespace,
                     )
                     logger.info(
                         f"Rebase processing completed for {rebase_data.jira_issue}, "
@@ -572,11 +596,14 @@ async def main() -> None:
                         ).model_dump_json(),
                     )
 
+        shutdown_event = asyncio.Event()
+        install_shutdown_handler(asyncio.get_running_loop(), shutdown_event)
         await run_task_loop(
             redis,
             [rebase_queue_todo, rebase_queue],
             process_task,
             max_concurrent=max_concurrent_tasks,
+            shutdown_event=shutdown_event,
         )
 
 

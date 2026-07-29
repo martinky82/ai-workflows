@@ -9,9 +9,16 @@ logger = logging.getLogger(__name__)
 
 
 class PackageUpdateState(BaseModel):
-    jira_issue: str
+    jira_issue: str | None
     package: str
     dist_git_branch: str
+    dist_git_namespace: str | None = Field(
+        default=None,
+        description=(
+            "Explicit GitLab rpms namespace (rhel or centos-stream) when the branch "
+            "name is ambiguous (modular stream-* branches)."
+        ),
+    )
     local_clone: Path | None = Field(default=None)
     update_branch: str | None = Field(default=None)
     fork_url: str | None = Field(default=None)

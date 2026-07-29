@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: phoenix-db-data
+  annotations:
+    trident.netapp.io/reclaimPolicy: Retain
+    volume.beta.kubernetes.io/storage-provisioner: netapp.io/trident
+  labels:
+    paas.redhat.com/appcode: JTNR-001
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: netapp-iscsi
+  volumeMode: Filesystem

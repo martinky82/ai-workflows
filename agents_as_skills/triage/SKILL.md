@@ -66,10 +66,13 @@ Save the result as `cve_eligibility_result` with these fields:
 - `needs_internal_fix` (bool or null) — true for CVEs where internal fix is needed first
 - `error` (string or null) — error message if the issue cannot be processed
 - `pending_zstream_issues` (list of strings or null) — Jira issue keys of unshipped Z-stream clones
+- `duplicate_of` (string or null) — Jira issue key of an older tracker for the same CVE, component, and fix version that was closed/rejected
 
 **Decision logic:**
 
-1. If `eligibility` is `"immediately"` → proceed to **Step 2**.
+1. If `eligibility` is `"immediately"`:
+   - If `duplicate_of` is set and `dry_run` is false, post an informational comment to `{{jira_issue}}` using `add_jira_comment`: `"An older tracker <duplicate_of> exists for the same CVE, component, and fix version, but it was closed/rejected. Proceeding with triage for this tracker."` If posting fails, log a warning but continue.
+   - Proceed to **Step 2**.
 
 2. If `force_cve_triage` is true AND there is no `error` → proceed to **Step 2** (override the eligibility check).
 
@@ -100,7 +103,21 @@ Save the result as `cve_eligibility_result` with these fields:
      ```
    - Skip to **Step 10: Comment in JIRA**.
 
-5. Otherwise (eligibility is `"never"` and no force):
+5. If `duplicate_of` is set (and eligibility is not `"immediately"` and no `error`):
+   - Set `triage_result` to:
+     ```json
+     {
+       "resolution": "open-ended-analysis",
+       "data": {
+         "summary": "Duplicate tracker detected. {{jira_issue}} appears to be a duplicate of <duplicate_of> (same CVE, component, and fix version).",
+         "recommendation": "Consider closing this issue as a duplicate of <duplicate_of>.",
+         "jira_issue": "{{jira_issue}}"
+       }
+     }
+     ```
+   - Skip to **Step 10: Comment in JIRA**.
+
+6. Otherwise (eligibility is `"never"` and no force and no duplicate):
    - Set `triage_result` to:
      ```json
      {
@@ -191,6 +208,7 @@ This path is for issues that represent a clear bug or CVE that needs a targeted 
    * There are 2 locations where you can search for the fixes: Fedora and upstream project.
    * First, check if the fix is in Fedora repository in `https://src.fedoraproject.org/rpms/<package_name>`.
      * In Fedora, search for .patch files and check git commit history for fixes using relevant keywords (CVE IDs, function names, error messages)
+     * If the fix is found in Fedora as a `.patch` file, use its raw file URL (`https://src.fedoraproject.org/rpms/<package>/raw/<ref>/f/<name>.patch`) in your patch_urls — not the upstream commit URL.
    * If it's not, identify the official upstream project from the following 2 sources and search there:
      * Links from the Jira issue (if any direct upstream links are provided)
      * Package spec file (`<package>.spec`) in the GitLab repository: check the URL field or Source0 field for upstream project location
@@ -203,7 +221,7 @@ This path is for issues that represent a clear bug or CVE that needs a targeted 
    * Using the details from your analysis, search these sources:
      - Bug Trackers (for fixed bugs matching the issue summary and description)
      - Git / Version Control (for commit messages, using keywords, CVE IDs, function names, etc.)
-   * **Always prefer patches from the canonical upstream repository** over mirrors or forks. For example, if the upstream is `https://gitlab.com/libtiff/libtiff`, use that — not a GitHub mirror like `https://github.com/libsdl-org/libtiff/`. Mirrors may carry extra commits or miss upstream changes.
+   * **When searching upstream**, always prefer the canonical upstream repository over mirrors or forks of the same project. For example, if the upstream is `https://gitlab.com/libtiff/libtiff`, use that — not a GitHub mirror like `https://github.com/libsdl-org/libtiff/`. Mirrors may carry extra commits or miss upstream changes. This applies only to choosing between repositories for the same upstream project — it does not apply to the Fedora-vs-upstream choice above.
    * Be thorough in your search - try multiple search terms and approaches based on the issue details
    * Advanced investigation techniques:
      - **Use targeted git searches when the issue describes specific code**:
@@ -897,7 +915,7 @@ Where:
 
 Post the formatted comment using `add_jira_comment` with:
 - `issue_key` = `{{jira_issue}}`
-- `comment` = `"Output from Ymir Triage Agent: \n\n<formatted_comment>\n\nWarning: This is an AI-Generated contribution and may contain mistakes. Please carefully review the contributions made by AI agents.\nYou can learn more about the Ymir project at https://docs.google.com/document/d/1zKeJQtIlGkgQ7QoEVFxz4dLVEjqB74_E3tW0_wCo6YM/edit?usp=sharing"`
+- `comment` = `"Output from Ymir Triage Agent: \n\n<formatted_comment>\n\nWarning: This is an AI-Generated contribution and may contain mistakes. Please carefully review the contributions made by AI agents.\nYou can learn more about the Ymir project at https://ymir.pages.redhat.com/\n\n💬 *Have suggestions or complaints?* Please reach out to us on the [Slack forum #forum-ymir-package-automation|https://redhat.enterprise.slack.com/archives/C095699FLMR] where your feedback will be more visible than pinging us on individual issues."`
 - `private` = true
 
 ---

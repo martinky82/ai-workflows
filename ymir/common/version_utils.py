@@ -8,6 +8,8 @@ strings in various formats (e.g., rhel-9.8, rhel-9.7.z, rhel-9.0.0.z).
 import contextvars
 import re
 
+_DIST_TAG_RE = re.compile(r"\.el(\d+)(_\d+)?")
+
 current_z_streams_override: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "current_z_streams_override", default=None
 )
@@ -65,6 +67,8 @@ def parse_branch_name(branch: str) -> tuple[str, str | None] | None:
       - rhel-10.1      -> ("10", "1")
       - rhel-10-main   -> ("10", None)
       - c9s, c10s      -> ("9", None), ("10", None)
+      - stream-nginx-1.26-rhel-9.9.0 -> ("9", "9")
+      - stream-squid-4-rhel-8.10.0   -> ("8", "10")
 
     Args:
         branch: Branch name like 'rhel-9.7.0', 'c9s', or 'rhel-10-main'
@@ -76,6 +80,13 @@ def parse_branch_name(branch: str) -> tuple[str, str | None] | None:
     zstream = parse_zstream_branch_name(branch)
     if zstream:
         return zstream
+
+    # Modular stream branches embed the RHEL version as a suffix:
+    # stream-<module>-<stream>-rhel-<major>.<minor>[.0]
+    modular = re.match(r"^stream-.+-rhel-(\d+)\.(\d+)(?:\.0)?$", branch.lower())
+    if modular:
+        return modular.group(1), modular.group(2)
+
     m = re.match(r"^(?:c(\d+)s|rhel-(\d+)-main)$", branch.lower())
     if not m:
         return None
@@ -116,6 +127,46 @@ def normalize_fix_version(fix_version: str, rhel_config: dict) -> str:
         return fix_version
 
     return f"rhel-{major}.{minor}.z"
+
+
+def get_maintenance_majors(rhel_config: dict) -> set[str]:
+    """Major versions with a Z-stream but no Y-stream (maintenance phase)."""
+    current_z_streams = rhel_config.get("current_z_streams", {})
+    current_y_streams = rhel_config.get("current_y_streams", {})
+    return set(current_z_streams.keys()) - set(current_y_streams.keys())
+
+
+async def get_maintenance_rhel_branch(branch: str) -> str | None:
+    """Get internal maintenance phase RHEL branch corresponding to the given CentOS Stream branch, if any."""
+    from ymir.common.base_utils import is_cs_branch
+    from ymir.common.config import load_rhel_config
+
+    if not is_cs_branch(branch):
+        return None
+    if not (parsed := parse_branch_name(branch)):
+        return None
+    major, _ = parsed
+
+    config = await load_rhel_config()
+    if major not in get_maintenance_majors(config):
+        return None
+    z_stream = config.get("current_z_streams", {}).get(major)
+    if not z_stream or not (z_parsed := parse_rhel_version(z_stream)):
+        return None
+    z_major, z_minor, _ = z_parsed
+    return construct_internal_branch_name(z_major, z_minor)
+
+
+def nvr_to_cs_nvr(nvr: str) -> str | None:
+    """Derive the CentOS Stream NVR from a Brew NVR by stripping the Z-stream suffix.
+
+    Brew Z-stream builds use dist tags like ``.el9_8``; the equivalent CentOS
+    Stream build uses ``.el9``.  Returns None if no dist tag is found.
+    """
+    match = _DIST_TAG_RE.search(nvr)
+    if not match:
+        return None
+    return nvr[: match.start()] + f".el{match.group(1)}" + nvr[match.end() :]
 
 
 def get_fix_version_variants(fix_version: str) -> list[str]:

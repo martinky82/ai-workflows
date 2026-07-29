@@ -6,6 +6,19 @@ a patch backport, or by requesting clarification when blocked.
 Issues that don't fit into rebase, backport, or clarification-needed
 categories should use "open-ended-analysis".
 
+**CRITICAL — CVE Applicability Rule**: You must NEVER resolve a CVE issue as
+"not-affected" based on version range analysis from NVD, advisories, or upstream
+vendor statements (e.g., "the affected range starts at version X and RHEL ships
+version Y"). Version ranges listed in advisories are frequently incomplete or
+inaccurate — vulnerable code may exist in versions outside the stated range, or
+may have been backported. Only a dedicated source code analysis (performed by a
+separate applicability agent after triage) can definitively determine whether a
+CVE affects the downstream package. Your job is to determine the resolution path
+(backport, rebuild, etc.), NOT to judge CVE applicability. Even when you believe
+the CVE does not affect the package, you must still search for the upstream fix
+and resolve as "backport" so that the applicability agent can verify your
+assumption against the actual source code.
+
 Goal: Analyze the given issue to determine the correct course of action.
 
 **Initial Analysis Steps**
@@ -39,9 +52,11 @@ Goal: Analyze the given issue to determine the correct course of action.
    * Determine the name of the package from the issue details (usually component name)
    {% if needs_internal_fix and internal_target_branch %}
    * Use the clone_repository tool to clone `https://gitlab.com/redhat/rhel/rpms/<package_name>`
-     with branch `{{ internal_target_branch }}`.
+     with branch `{{ internal_target_branch }}` and
+     clone_path `/git-repos/{{ issue }}/<package_name>`.
      If the clone fails (branch or repo not found), fall back to cloning
-     `https://gitlab.com/redhat/centos-stream/rpms/<package_name>` using the same tool.
+     `https://gitlab.com/redhat/centos-stream/rpms/<package_name>` using the same tool
+     (keep the same clone_path).
    {% else %}
    * Confirm the package repository exists by running
      `GIT_TERMINAL_PROMPT=0 git ls-remote https://gitlab.com/redhat/centos-stream/rpms/<package_name>`
@@ -102,6 +117,9 @@ You must decide between one of the following actions. Follow these guidelines to
      * In Fedora, search for .patch files and check git commit history
        for fixes using relevant keywords (CVE IDs, function names,
        error messages)
+     * If the fix is found in Fedora as a `.patch` file, use its raw
+       file URL (`https://src.fedoraproject.org/rpms/<package>/raw/<ref>/f/<name>.patch`)
+       in your patch_urls — not the upstream commit URL.
    * If it's not, identify the official upstream project from the following 2 sources and search there:
       * Links from the Jira issue (if any direct upstream links are provided)
       * Package spec file (<package>.spec) in the GitLab repository:
@@ -117,10 +135,13 @@ You must decide between one of the following actions. Follow these guidelines to
    * Using the details from your analysis, search these sources:
      - Bug Trackers (for fixed bugs matching the issue summary and description)
      - Git / Version Control (for commit messages, using keywords, CVE IDs, function names, etc.)
-   * **Always prefer patches from the canonical upstream repository** over mirrors or forks.
-     For example, if the upstream is `https://gitlab.com/libtiff/libtiff`, use that — not
-     a GitHub mirror like `https://github.com/libsdl-org/libtiff/`. Mirrors may carry
-     extra commits or miss upstream changes.
+   * **When searching upstream**, always prefer the canonical upstream repository over
+     mirrors or forks of the same project. For example, if the upstream is
+     `https://gitlab.com/libtiff/libtiff`, use that — not a GitHub mirror like
+     `https://github.com/libsdl-org/libtiff/`. Mirrors may carry extra commits or
+     miss upstream changes. This applies only to choosing between repositories for
+     the same upstream project — it does not apply to the Fedora-vs-upstream choice
+     above.
    * Be thorough in your search - try multiple search terms and approaches based on the issue details
    * Advanced investigation techniques:
      - **Use targeted git searches when the issue describes specific code**:
@@ -337,6 +358,13 @@ You must decide between one of the following actions. Follow these guidelines to
    3.3. You must provide a clear justification explaining why a rebuild is needed
         and how it addresses the issue.
    3.4. If rebuild: set Jira fields as per the instructions below.
+   {% if is_older_zstream %}
+   3.5. Check the Jira issue description and comments for any mention of a build
+        side-tag. A side-tag is a Koji build tag name that the build pipeline
+        needs when building packages for this z-stream (e.g.,
+        "rhel-9.4.0-z-build-sidetag-188995"). If a side-tag is mentioned, set
+        the `side_tag` field in your output to the exact side-tag name.
+   {% endif %}
 
 4. **Open-Ended Analysis**
    This is the catch-all for issues that are NOT bugs or CVEs
