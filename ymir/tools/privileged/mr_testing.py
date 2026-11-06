@@ -4,10 +4,9 @@ workflow.
 
 Ported from the ``mr_testing`` Claude Code skill's ``parse_results.py``
 (``parse_anewa_comments``, ``parse_newa_comment``,
-``parse_osci_results_comment``, and ``extract_tf_request_from_job_trace`` --
-this agent only ever works from MR comments/CI traces, never a local
-statedir) and ``format_comments.py`` (all seven actions, including gating
-mode's ``gating_results_markdown``). The exact parsing/formatting logic and
+``parse_osci_results_comment``, and ``extract_tf_request_from_job_trace``)
+and ``format_comments.py`` (all seven actions, including gating mode's
+``gating_results_markdown``). The exact parsing/formatting logic and
 markdown templates are preserved so output stays consistent with the skill
 this replaces.
 
